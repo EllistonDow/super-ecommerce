@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/commerce-kernel",
+    "crates/kernel-napi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Super Ecommerce Contributors"]
+
+[workspace.lints.clippy]
+all = "warn"

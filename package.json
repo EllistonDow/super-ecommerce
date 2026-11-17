@@ -1,0 +1,22 @@
+{
+  "name": "super-ecommerce",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Next-generation full-stack headless commerce engine powered by TypeScript, Rust commerce-kernel, and PostgreSQL 17",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "node --experimental-strip-types apps/api/src/dev-server.ts",
+    "bench": "node --experimental-strip-types packages/kernel/src/benchmark.ts",
+    "configurator": "node --experimental-strip-types packages/configurator/src/cli.ts",
+    "test:rust": "cargo test --workspace",
+    "test:ts": "node --experimental-strip-types --test packages/kernel/src/kernel.test.ts packages/db/src/db.test.ts packages/workflow/src/workflow.test.ts packages/core/src/core.test.ts packages/plugin-sdk/src/plugin-sdk.test.ts packages/configurator/src/configurator.test.ts packages/mcp-server/src/mcp-server.test.ts apps/api/src/api.test.ts apps/storefront/src/storefront.test.ts apps/admin/src/admin.test.ts",
+    "test": "npm run test:rust && npm run test:ts"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "super-ecommerce",
+      "runtimeExecutable": "/Users/austin/.local/bin/node",
+      "runtimeArgs": [
+        "--experimental-strip-types",
+        "apps/api/src/dev-server.ts"
+      ],
+      "port": 4100
+    },
+    {
+      "name": "super-ecommerce-verification",
+      "runtimeExecutable": "/usr/bin/env",
+      "runtimeArgs": [
+        "PORT=4101",
+        "/Users/austin/.local/bin/node",
+        "--experimental-strip-types",
+        "apps/api/src/dev-server.ts"
+      ],
+      "port": 4101
+    }
+  ]
+}

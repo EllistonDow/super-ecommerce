@@ -1,0 +1,14 @@
+{
+  "name": "@super-ecommerce/configurator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./cli": "./src/cli.ts"
+  },
+  "scripts": {
+    "cli": "node --experimental-strip-types src/cli.ts",
+    "test": "node --experimental-strip-types --test src/configurator.test.ts"
+  }
+}

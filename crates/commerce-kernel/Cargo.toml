@@ -1,0 +1,9 @@
+[package]
+name = "commerce-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-float deterministic pricing, two-pass discount allocation, and MSI inventory splitting kernel for Super Ecommerce"
+
+[lints]
+workspace = true

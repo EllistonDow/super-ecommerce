@@ -1,0 +1,22 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# QA & Browser artifacts
+.playwright-mcp/
+*.png
+
+# Claude local settings
+.claude/settings.local.json
+.claude/.cc-writes/
+
+# Environment & OS
+.env
+.env.*
+!.env.example
+.DS_Store
