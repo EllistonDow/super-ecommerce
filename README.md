@@ -5,6 +5,7 @@
 **Next-Generation Full-Stack Headless Commerce Engine**  
 *Powered by TypeScript, Rust Commerce Kernel, and PostgreSQL 17*
 
+[![CI](https://img.shields.io/github/actions/workflow/status/EllistonDow/super-ecommerce/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/EllistonDow/super-ecommerce/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/EllistonDow/super-ecommerce?color=blue&style=flat-square)](https://github.com/EllistonDow/super-ecommerce/releases)
 [![Tests](https://img.shields.io/badge/tests-112%2F112%20passing-brightgreen?style=flat-square)](https://github.com/EllistonDow/super-ecommerce)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-336791?style=flat-square&logo=postgresql&logoColor=white)](https://www.postgresql.org/)

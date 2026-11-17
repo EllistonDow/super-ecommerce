@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust Kernel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+
+      - name: Cargo check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: Run Rust workspace test suite
+        run: cargo test --workspace --verbose
+
+  typescript:
+    name: TypeScript Full-Stack Tests (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22.x"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+
+      - name: Build native N-API cdylib addon
+        run: |
+          cargo build --release --manifest-path crates/kernel-napi/Cargo.toml
+          mkdir -p packages/kernel/native
+          if [ -f "target/release/libkernel_napi.so" ]; then
+            cp target/release/libkernel_napi.so packages/kernel/native/commerce_kernel.node
+          elif [ -f "target/release/libkernel_napi.dylib" ]; then
+            cp target/release/libkernel_napi.dylib packages/kernel/native/commerce_kernel.node
+          fi
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run full-stack TypeScript test suite (100 tests)
+        run: npm run test:ts
+
+      - name: Run kernel benchmark smoke test
+        run: npm run bench
+
+      - name: Run configurator diff smoke test
+        run: npm run configurator diff
