@@ -7,18 +7,21 @@ import {
   B2bOrganizationService,
   buildCancelOrderWorkflow,
   buildCompleteCheckoutWorkflow,
+  buildEditOrderWorkflow,
   buildFulfillmentDispatchWorkflow,
   buildProcessReturnRefundWorkflow,
   MsiInventoryService,
   OutboxRelayWorker,
   PgAdminAuthRbacService,
   PgB2bOrganizationService,
+  PgCustomerAuthAndCartService,
   PgCustomersService,
   PgDoubleEntryLedgerService,
   PgMsiInventoryService,
   PgOrdersRepository,
   PgReservationTtlReaperService,
   PgSlottedInventoryService,
+  PgStripePaymentIntentService,
   PgStripeWebhookService,
   PgTransactionalOutboxService,
   UnbalancedJournalError,
@@ -2635,6 +2638,254 @@ describe("@super-ecommerce/core — PostgreSQL Primary Stores (PgPoolLike)", () 
           }),
         UnbalancedJournalError
       );
+    } finally {
+      await pg.close();
+    }
+  });
+
+  it("executes C-end customer auth, persistent cart guest-to-member merge, Stripe PaymentIntent 3DS/REST state machine, and OMS pre-fulfillment Order Editing", async () => {
+    const pg = new OfflinePgPool();
+    await runMigrations(pg);
+    try {
+      const custCart = new PgCustomerAuthAndCartService(pg);
+
+      // 1. Register member & seed 2 keyboards in member cart ($390 base, $340 at qty >= 5)
+      const reg = await custCart.registerCustomer({
+        email: "claire@kronos.io",
+        passwordPlain: "Claire!Shopper2026",
+        fullName: "Claire Mercer",
+        defaultChannelSlug: "us-retail",
+        currencyCode: "USD",
+      });
+      assert.equal(custCart.verifyCustomerSessionToken(reg.sessionToken).valid, true);
+
+      const addr1 = await custCart.saveAddress({
+        customerId: reg.customer.customerId,
+        label: "Home",
+        recipientName: "Claire Mercer",
+        line1: "400 Market St",
+        city: "San Francisco",
+        postalCode: "94105",
+        countryCode: "US",
+        isDefaultShipping: true,
+      });
+      assert.equal(addr1.isDefaultShipping, true);
+
+      const memberCart = await custCart.createOrGetActiveCart({
+        channelSlug: "us-retail",
+        currencyCode: "USD",
+        customerId: reg.customer.customerId,
+      });
+      await custCart.upsertCartLine({
+        cartId: memberCart.cartId,
+        variantId: "VAR-KB-75",
+        sku: "KR-KB75-TI",
+        title: "Kronos Field 75",
+        quantity: 2,
+        baseUnitPrice: 39_000n,
+        tierPrices: [{ minQuantity: 5, unitAmount: 34_000n }],
+      });
+
+      // 2. Anonymous visitor creates guest cart with 3 keyboards + $15 voucher
+      const guestCart = await custCart.createOrGetActiveCart({
+        channelSlug: "us-retail",
+        currencyCode: "USD",
+        guestToken: "guest_sess_abc123",
+      });
+      await custCart.upsertCartLine({
+        cartId: guestCart.cartId,
+        variantId: "VAR-KB-75",
+        sku: "KR-KB75-TI",
+        title: "Kronos Field 75",
+        quantity: 3,
+        baseUnitPrice: 39_000n,
+        tierPrices: [{ minQuantity: 5, unitAmount: 34_000n }],
+      });
+      await custCart.applyCartVoucher({
+        cartId: guestCart.cartId,
+        voucherCode: "SAVE15",
+        discount: {
+          discountId: "vouch-save15",
+          name: "$15 Welcome Voucher",
+          kind: "ORDER_VOUCHER",
+          value: { type: "FIXED", amount: 1_500n },
+        },
+      });
+
+      // 3. Login with guestCartId -> atomic merge yields 5 units @ $340 ($1,700) - $15 voucher = $1,685 (168_500n)!
+      const loginRes = await custCart.authenticateCustomer({
+        email: "claire@kronos.io",
+        passwordPlain: "Claire!Shopper2026",
+        guestCartId: guestCart.cartId,
+      });
+      assert.equal(loginRes.ok, true);
+      assert.equal(loginRes.mergedCart?.lines[0]?.quantity, 5);
+      assert.equal(loginRes.mergedCart?.pricing.lines[0]?.effectiveBaseUnitPrice, 34_000n);
+      assert.equal(loginRes.mergedCart?.pricing.totalGrossAmount, 168_500n);
+      const oldGuestAfter = await custCart.getHydratedCart(guestCart.cartId);
+      assert.equal(oldGuestAfter?.status, "MERGED");
+
+      // 4. Stripe Live REST Mode verification (verifying Bearer auth, Idempotency-Key, form body)
+      const stripeRestCalls: { url: string; idemKey: string | null; body: string }[] = [];
+      const liveModePiService = new PgStripePaymentIntentService({
+        pool: pg,
+        stripeSecretKey: "sk_test_mock_key_2026",
+        fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+          const u = String(url);
+          const headers = new Headers(init?.headers);
+          stripeRestCalls.push({
+            url: u,
+            idemKey: headers.get("idempotency-key"),
+            body: String(init?.body ?? ""),
+          });
+          return new Response(
+            JSON.stringify({
+              id: "pi_live_rest_001",
+              client_secret: "pi_live_rest_001_secret_xyz",
+              status: "succeeded",
+              amount: 168500,
+              amount_capturable: 0,
+              amount_received: 168500,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } }
+          );
+        }) as typeof fetch,
+      });
+
+      const livePi = await liveModePiService.createPaymentIntent({
+        idempotencyKey: "idem-stripe-live-1",
+        checkoutId: "chk-live-1",
+        channelSlug: "us-retail",
+        currencyCode: "USD",
+        amount: 168_500n,
+        paymentMethodToken: "pm_card_visa",
+        confirmImmediately: true,
+      });
+      assert.equal(livePi.providerMode, "STRIPE_LIVE_API");
+      assert.equal(livePi.paymentIntentId, "pi_live_rest_001");
+      assert.equal(stripeRestCalls.length, 1);
+      assert.equal(stripeRestCalls[0]?.idemKey, "idem-stripe-live-1");
+      assert.match(stripeRestCalls[0]?.body ?? "", /amount=168500/);
+
+      // 5. Stripe 3DS + Two-Phase Manual Capture -> Checkout -> OMS Pre-Fulfillment Order Editing
+      const localStripe = new PgStripePaymentIntentService({ pool: pg });
+      const pi3ds = await localStripe.createPaymentIntent({
+        idempotencyKey: "idem-3ds-1",
+        checkoutId: "chk-oms-edit-1",
+        channelSlug: "us-retail",
+        currencyCode: "USD",
+        amount: 22_000n, // 2 units @ $100 + 10% tax = $220.00
+        captureMethod: "manual",
+        paymentMethodToken: "pm_card_3ds_required",
+        confirmImmediately: true,
+      });
+      assert.equal(pi3ds.status, "requires_action");
+      assert.ok(pi3ds.nextActionRedirectUrl);
+
+      const after3ds = await localStripe.complete3dsChallenge(pi3ds.paymentIntentId);
+      assert.equal(after3ds.status, "requires_capture");
+      assert.equal(after3ds.amountCapturable, 22_000n);
+
+      const inv = new PgMsiInventoryService(pg);
+      await inv.upsertExternalSlots([
+        {
+          warehouseId: "WH-EAST",
+          priorityRank: 1,
+          linkedToChannel: true,
+          supportsShippingZone: true,
+          variantId: "VAR-DAC",
+          quantityOnHand: 10,
+          quantityReserved: 0,
+          quantityAllocated: 0,
+        },
+      ]);
+      const outbox = new PgTransactionalOutboxService(pg);
+      const wfStore = new PgWorkflowStateStore(pg);
+      const stripeStrategy = localStripe.asPaymentGatewayStrategy("us-retail");
+
+      const checkoutWf = buildCompleteCheckoutWorkflow({
+        inventoryService: inv,
+        paymentGateway: stripeStrategy,
+        outboxService: outbox,
+        pgPool: pg,
+      });
+
+      const chkRes = await checkoutWf.execute(
+        {
+          checkoutId: "chk-oms-edit-1",
+          channelSlug: "us-retail",
+          customerId: reg.customer.customerId,
+          stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+          allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+          paymentToken: pi3ds.paymentIntentId, // Captures the pre-authorized 3DS PaymentIntent!
+          cart: {
+            currencyCode: "USD",
+            taxMode: "TAX_EXCLUSIVE",
+            shippingBaseAmount: 0n,
+            shippingTaxRateBps: 0,
+            lines: [
+              {
+                lineId: "L-DAC",
+                variantId: "VAR-DAC",
+                quantity: 2,
+                baseUnitPrice: 10_000n,
+                taxRateBps: 1_000,
+              },
+            ],
+          },
+        },
+        { idempotencyKey: "idem-chk-oms-1", store: wfStore }
+      );
+      assert.equal(chkRes.status, "COMPLETED");
+
+      // OMS Edit #1: Increase quantity from 2 -> 4 (+2 units => +$220.00 incremental capture + +2 MSI stock)
+      const editWf = buildEditOrderWorkflow({
+        pgPool: pg,
+        inventoryService: inv,
+        paymentGateway: stripeStrategy,
+        outboxService: outbox,
+      });
+
+      const editUp = await editWf.execute(
+        {
+          editId: "edit-up-1",
+          orderId: "ord_chk-oms-edit-1",
+          editedBy: "ops@kronos.io",
+          reason: "Customer requested 2 additional units",
+          lineMutations: [{ lineId: "L-DAC", variantId: "VAR-DAC", quantity: 4 }],
+          paymentTokenForIncrementalCapture: "pm_card_visa_saved",
+        },
+        { idempotencyKey: "idem-edit-up-1", store: wfStore }
+      );
+      assert.equal(editUp.status, "COMPLETED");
+      assert.equal(editUp.output?.settlementKind, "INCREMENTAL_CAPTURE");
+      assert.equal(editUp.output?.deltaGrossAmount, 22_000n);
+      assert.equal(editUp.output?.revisedGrossAmount, 44_000n);
+      assert.equal((await inv.getSlot("WH-EAST", "VAR-DAC"))?.quantityAllocated, 4);
+
+      // OMS Edit #2: Decrease quantity from 4 -> 1 (-3 units => -$330.00 partial refund, -3 MSI stock released!)
+      // Wait: original pi3ds captured $220.00, so let's decrease from 4 -> 3 (-1 unit => -$110.00 partial refund on original PI!)
+      const editDown = await editWf.execute(
+        {
+          editId: "edit-down-2",
+          orderId: "ord_chk-oms-edit-1",
+          editedBy: "ops@kronos.io",
+          reason: "Customer reduced 1 unit before shipment",
+          lineMutations: [{ lineId: "L-DAC", variantId: "VAR-DAC", quantity: 3 }],
+        },
+        { idempotencyKey: "idem-edit-down-2", store: wfStore }
+      );
+      assert.equal(editDown.status, "COMPLETED");
+      assert.equal(editDown.output?.settlementKind, "PARTIAL_REFUND");
+      assert.equal(editDown.output?.deltaGrossAmount, -11_000n);
+      assert.equal(editDown.output?.revisedGrossAmount, 33_000n);
+      assert.equal((await inv.getSlot("WH-EAST", "VAR-DAC"))?.quantityAllocated, 3);
+
+      // Verify Double-Entry Subledger remains 100% balanced after Order + Incremental Edit + Partial Refund Edit!
+      const subledger = new PgDoubleEntryLedgerService(pg);
+      const tb = await subledger.getTrialBalance("USD");
+      assert.equal(tb.isBalanced, true);
+      assert.equal(tb.grandTotalDebits, tb.grandTotalCredits);
     } finally {
       await pg.close();
     }

@@ -29,6 +29,7 @@ export type LedgerPostingDirection = "DEBIT" | "CREDIT";
 export type JournalReferenceType =
   | "ORDER_CAPTURE"
   | "RMA_REFUND"
+  | "ORDER_EDIT_DELTA"
   | "STORE_CREDIT_TOPUP"
   | "MANUAL_ADJUSTMENT";
 

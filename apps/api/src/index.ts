@@ -30,21 +30,30 @@ import {
 } from "@super-ecommerce/workflow";
 import {
   buildCompleteCheckoutWorkflow,
+  buildEditOrderWorkflow,
   buildProcessReturnRefundWorkflow,
   InvalidOrderCursorError,
+  listOrderEditsFromPg,
   PgB2bOrganizationService,
+  PgCustomerAuthAndCartService,
+  PgCustomersService,
   PgDoubleEntryLedgerService,
   PgMsiInventoryService,
   PgOrdersRepository,
   PgReservationTtlReaperService,
+  PgStripePaymentIntentService,
   PgStripeWebhookService,
   PgTransactionalOutboxService,
   StripeWebhookVerificationError,
+  type AddStoreCreditInput,
   type CompleteCheckoutInput,
+  type CreatePaymentIntentInput,
+  type EditOrderInput,
   type ListOrdersKeysetInput,
   type MsiInventoryServiceLike,
   type PaymentGatewayStrategy,
   type ProcessReturnRefundInput,
+  type SaveCustomerAddressInput,
   type StockReservationStatus,
   type SubmitB2bPurchaseOrderInput,
 } from "@super-ecommerce/core";
@@ -140,13 +149,76 @@ function jsonReplacer(_key: string, value: unknown): unknown {
   return typeof value === "bigint" ? value.toString() : value;
 }
 
+const CORS_HEADERS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type, authorization, stripe-signature",
+};
+
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, jsonReplacer), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
+      ...CORS_HEADERS,
     },
   });
+}
+
+function toBigIntMinor(val: unknown): bigint {
+  if (typeof val === "bigint") return val;
+  if (typeof val === "number") return BigInt(Math.trunc(val));
+  if (typeof val === "string") {
+    const cleaned = val.endsWith("n") ? val.slice(0, -1) : val;
+    return BigInt(cleaned);
+  }
+  return 0n;
+}
+
+function normalizeCartInputFromJson(raw: CartCalculationInput): CartCalculationInput {
+  return {
+    ...raw,
+    shippingBaseAmount: toBigIntMinor(raw.shippingBaseAmount),
+    lines: (raw.lines ?? []).map((line) => ({
+      ...line,
+      baseUnitPrice: toBigIntMinor(line.baseUnitPrice),
+      unitCostAmount:
+        line.unitCostAmount !== undefined ? toBigIntMinor(line.unitCostAmount) : undefined,
+      tierPrices: line.tierPrices?.map((t) => ({
+        ...t,
+        unitAmount: toBigIntMinor(t.unitAmount),
+      })),
+      candidateLineDiscounts: line.candidateLineDiscounts?.map((d) => ({
+        ...d,
+        value:
+          d.value.type === "FIXED"
+            ? { type: "FIXED", amount: toBigIntMinor(d.value.amount) }
+            : d.value,
+      })),
+    })),
+    candidateOrderDiscounts: raw.candidateOrderDiscounts?.map((d) => ({
+      ...d,
+      value:
+        d.value.type === "FIXED"
+          ? { type: "FIXED", amount: toBigIntMinor(d.value.amount) }
+          : d.value,
+    })),
+  };
+}
+
+function normalizeCheckoutInputFromJson(raw: CompleteCheckoutInput): CompleteCheckoutInput {
+  return {
+    ...raw,
+    cart: normalizeCartInputFromJson(raw.cart),
+    expectedTotalGrossAmount:
+      raw.expectedTotalGrossAmount !== undefined
+        ? toBigIntMinor(raw.expectedTotalGrossAmount)
+        : undefined,
+    storeCreditToRedeem:
+      raw.storeCreditToRedeem !== undefined
+        ? toBigIntMinor(raw.storeCreditToRedeem)
+        : undefined,
+  };
 }
 
 export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions = {}) {
@@ -160,26 +232,21 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
   const workflowStore = new PgWorkflowStateStore(pgPool);
   const ordersRepo = new PgOrdersRepository(pgPool);
   const subledger = new PgDoubleEntryLedgerService(pgPool);
+  const customersService = new PgCustomersService(pgPool);
+  const customerCartService = new PgCustomerAuthAndCartService(pgPool);
+  const paymentIntentService = new PgStripePaymentIntentService({ pool: pgPool });
   const mcpServer = new SuperCommerceMcpServer(projections);
   const maxGraphQlDepth = options.maxGraphQlDepth ?? 8;
   const maxGraphQlAliases = options.maxGraphQlAliases ?? 8;
 
   const defaultPaymentGateway: PaymentGatewayStrategy =
-    options.paymentGateway ?? {
-      async capture({ checkoutId, amount }) {
-        return {
-          transactionId: `tx_${checkoutId}`,
-          provider: "super-pay",
-          capturedAmount: amount,
-        };
-      },
-      async voidOrRefund() {},
-    };
+    options.paymentGateway ?? paymentIntentService.asPaymentGatewayStrategy();
 
   const checkoutWorkflow = buildCompleteCheckoutWorkflow({
     inventoryService,
     paymentGateway: defaultPaymentGateway,
     outboxService,
+    storeCreditLedger: customersService,
     pgPool,
   });
 
@@ -187,7 +254,15 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
     inventoryService,
     paymentGateway: defaultPaymentGateway,
     outboxService,
+    storeCreditLedger: customersService,
     pgPool,
+  });
+
+  const orderEditWorkflow = buildEditOrderWorkflow({
+    pgPool,
+    inventoryService,
+    paymentGateway: defaultPaymentGateway,
+    outboxService,
   });
 
   const b2bService = new PgB2bOrganizationService({
@@ -206,7 +281,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
 
   const sagaRecoveryWorker = new SagaRecoveryWorker({
     store: workflowStore,
-    workflows: [checkoutWorkflow, rmaWorkflow],
+    workflows: [checkoutWorkflow, rmaWorkflow, orderEditWorkflow],
   });
 
   const stripeWebhookService = new PgStripeWebhookService({
@@ -270,6 +345,112 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         if (!isReady) await ensureReady();
         return ordersRepo.getSkuRevenueAnalytics(params);
       },
+      edit: async (params: { idempotencyKey: string; input: EditOrderInput }) => {
+        if (!isReady) await ensureReady();
+        return orderEditWorkflow.execute(params.input, {
+          idempotencyKey: params.idempotencyKey,
+          store: workflowStore,
+        });
+      },
+      listEdits: async (params?: { readonly orderId?: string; readonly limit?: number }) => {
+        if (!isReady) await ensureReady();
+        return listOrderEditsFromPg(pgPool, params);
+      },
+    },
+    customers: {
+      list: async (limit = 50) => {
+        if (!isReady) await ensureReady();
+        return customersService.listCustomers(limit);
+      },
+      addStoreCredit: async (input: AddStoreCreditInput) => {
+        if (!isReady) await ensureReady();
+        return customersService.addStoreCredit(input);
+      },
+      register: async (params: Parameters<typeof customerCartService.registerCustomer>[0]) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.registerCustomer(params);
+      },
+      login: async (params: Parameters<typeof customerCartService.authenticateCustomer>[0]) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.authenticateCustomer(params);
+      },
+      saveAddress: async (input: SaveCustomerAddressInput) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.saveAddress(input);
+      },
+      listAddresses: async (customerId: string) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.listAddresses(customerId);
+      },
+    },
+    carts: {
+      createOrGet: async (
+        params: Parameters<typeof customerCartService.createOrGetActiveCart>[0]
+      ) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.createOrGetActiveCart(params);
+      },
+      get: async (cartId: string) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.getHydratedCart(cartId);
+      },
+      listRecent: async (limit?: number) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.listRecentCarts(limit);
+      },
+      upsertLine: async (
+        params: Parameters<typeof customerCartService.upsertCartLine>[0]
+      ) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.upsertCartLine(params);
+      },
+      applyVoucher: async (
+        params: Parameters<typeof customerCartService.applyCartVoucher>[0]
+      ) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.applyCartVoucher(params);
+      },
+      mergeGuestCart: async (params: { guestCartId: string; customerId: string }) => {
+        if (!isReady) await ensureReady();
+        return customerCartService.mergeGuestCartIntoCustomerCart(params);
+      },
+    },
+    payments: {
+      createIntent: async (input: CreatePaymentIntentInput) => {
+        if (!isReady) await ensureReady();
+        return paymentIntentService.createPaymentIntent(input);
+      },
+      complete3ds: async (paymentIntentId: string) => {
+        if (!isReady) await ensureReady();
+        return paymentIntentService.complete3dsChallenge(paymentIntentId);
+      },
+      captureIntent: async (params: {
+        paymentIntentId: string;
+        amountToCapture?: bigint;
+      }) => {
+        if (!isReady) await ensureReady();
+        return paymentIntentService.capturePaymentIntent(
+          params.paymentIntentId,
+          params.amountToCapture
+        );
+      },
+      refundOrCancelIntent: async (params: {
+        paymentIntentId: string;
+        amount?: bigint;
+      }) => {
+        if (!isReady) await ensureReady();
+        return paymentIntentService.refundOrCancelPaymentIntent(params);
+      },
+      listRecent: async (limit?: number) => {
+        if (!isReady) await ensureReady();
+        return paymentIntentService.listRecentPaymentIntents(limit);
+      },
+    },
+    outbox: {
+      listPending: async (limit?: number) => {
+        if (!isReady) await ensureReady();
+        return outboxService.listPending(limit);
+      },
     },
     ledger: {
       getTrialBalance: async (params?: { readonly currencyCode?: string }) => {
@@ -284,6 +465,10 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
       },
     },
     inventory: {
+      listSlots: async (limit = 100) => {
+        if (!isReady) await ensureReady();
+        return inventoryService.listAllSlots(limit);
+      },
       listReservations: async (statusFilter?: StockReservationStatus) => {
         if (!isReady) await ensureReady();
         return inventoryService.listReservations(statusFilter);
@@ -363,6 +548,9 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
    * Web Standard `fetch` handler (`(req: Request) => Promise<Response>`).
    */
   async function fetch(req: Request): Promise<Response> {
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
     if (!isReady) await ensureReady();
     const url = new URL(req.url);
 
@@ -378,7 +566,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
       }
       return jsonResponse({
         status: "ok",
-        version: "0.2.0",
+        version: "0.3.0",
         engine: "super-ecommerce",
         database: "postgres",
         storage: "postgresql",
@@ -394,9 +582,9 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         openapi: "3.1.0",
         info: {
           title: "Super Ecommerce Headless Commerce Gateway API",
-          version: "0.2.0",
+          version: "0.3.0",
           description:
-            "Zero-float deterministic commerce API powered by Rust commerce-kernel, PostgreSQL 17 Durable Sagas, Double-Entry Subledger, and Model Context Protocol (MCP).",
+            "Zero-float deterministic commerce API powered by Rust commerce-kernel, PostgreSQL 17 Durable Sagas, Double-Entry Subledger, C-End Carts, Stripe PaymentIntents, OMS Order Editing, and Model Context Protocol (MCP).",
         },
         paths: {
           "/healthz": { get: { summary: "Database & kernel readiness probe" } },
@@ -405,14 +593,38 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
           "/rpc/catalog.search": { post: { summary: "0-JOIN CQRS projection search" } },
           "/rpc/catalog.hybridSearch": { post: { summary: "BM25 + Vector RRF hybrid search" } },
           "/rpc/pricing.calculate": { post: { summary: "Two-pass Hare-Niemeyer + Margin Floor Guard pricing" } },
+          "/rpc/customers.list": { post: { summary: "List C-end customers & store credit balances" } },
+          "/rpc/customers.register": { post: { summary: "Register C-end customer with salted scrypt password" } },
+          "/rpc/customers.login": { post: { summary: "Authenticate C-end customer & atomically merge guest cart" } },
+          "/rpc/customers.saveAddress": { post: { summary: "Upsert customer shipping/billing address book entry" } },
+          "/rpc/customers.listAddresses": { post: { summary: "List customer saved addresses" } },
+          "/rpc/carts.createOrGet": { post: { summary: "Create or retrieve persistent multi-channel PostgreSQL cart" } },
+          "/rpc/carts.get": { post: { summary: "Hydrate persistent cart with live Rust pricing" } },
+          "/rpc/carts.listRecent": { post: { summary: "List recent active & merged persistent carts" } },
+          "/rpc/carts.upsertLine": { post: { summary: "Add, update, or remove persistent cart line" } },
+          "/rpc/carts.applyVoucher": { post: { summary: "Apply voucher discount to persistent cart" } },
+          "/rpc/carts.mergeGuestCart": { post: { summary: "Atomically merge guest cart into member cart" } },
+          "/rpc/payments.createIntent": { post: { summary: "Create dual-mode Stripe PaymentIntent (REST or 3DS simulator)" } },
+          "/rpc/payments.complete3ds": { post: { summary: "Complete 3DS authentication challenge on PaymentIntent" } },
+          "/rpc/payments.captureIntent": { post: { summary: "Capture manual-capture PaymentIntent" } },
+          "/rpc/payments.listRecent": { post: { summary: "List recent Stripe PaymentIntents" } },
           "/rpc/checkout.complete": { post: { summary: "5-step Durable Saga checkout with mutual-exclusion lease" } },
           "/rpc/rma.processReturn": { post: { summary: "Multi-wave partial RMA return & refund Saga" } },
           "/rpc/orders.list": { post: { summary: "Keyset-paginated orders query" } },
           "/rpc/orders.get": { post: { summary: "Hydrated order & returns lookup" } },
+          "/rpc/orders.edit": { post: { summary: "OMS pre-fulfillment Order Editing Saga with inventory & ledger delta" } },
+          "/rpc/orders.listEdits": { post: { summary: "List OMS pre-fulfillment order edit audit records" } },
           "/rpc/orders.analyticsBySku": { post: { summary: "Normalized order_lines SKU revenue & tax aggregation" } },
+          "/rpc/inventory.listSlots": { post: { summary: "List MSI warehouse stock slots" } },
+          "/rpc/inventory.listReservations": { post: { summary: "List active & reaped MSI stock reservations" } },
+          "/rpc/inventory.reapExpiredReservations": { post: { summary: "Reap expired TTL reservations & B2B holds" } },
+          "/rpc/outbox.listPending": { post: { summary: "List pending transactional outbox events" } },
           "/rpc/ledger.getTrialBalance": { post: { summary: "Double-Entry Subledger trial balance verification" } },
           "/rpc/workflow.recoverOrphans": { post: { summary: "Trigger SagaRecoveryWorker orphan scan" } },
+          "/rpc/b2b.listCompanies": { post: { summary: "List B2B enterprise companies & credit limits" } },
+          "/rpc/b2b.listPurchaseOrders": { post: { summary: "List B2B purchase orders" } },
           "/rpc/b2b.submitPo": { post: { summary: "Enterprise B2B purchase order submission & 72h hold" } },
+          "/rpc/b2b.decidePo": { post: { summary: "Approve or reject pending B2B purchase order" } },
         },
       });
     }
@@ -572,7 +784,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         }
         case "pricing.calculate": {
           const calc = await rpcClient.pricing.calculate(
-            body as unknown as CartCalculationInput
+            normalizeCartInputFromJson(body as unknown as CartCalculationInput)
           );
           return jsonResponse({ ok: true, data: calc });
         }
@@ -582,7 +794,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         }
         case "mcp.diagnoseWaterfall": {
           const diag = await rpcClient.mcp.diagnoseWaterfall(
-            body as unknown as CartCalculationInput
+            normalizeCartInputFromJson(body as unknown as CartCalculationInput)
           );
           return jsonResponse({ ok: true, data: diag });
         }
@@ -592,6 +804,227 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
               typeof body["channelSlug"] === "string" ? body["channelSlug"] : undefined,
           });
           return jsonResponse({ ok: true, data: stats });
+        }
+        case "orders.edit": {
+          const rawBody = body as unknown as {
+            idempotencyKey: string;
+            input: EditOrderInput & { actorId?: string };
+          };
+          const normalizedEditInput: EditOrderInput = {
+            ...rawBody.input,
+            editedBy: String(rawBody.input.editedBy ?? rawBody.input.actorId ?? "admin"),
+            revisedShippingBaseAmount:
+              rawBody.input.revisedShippingBaseAmount !== undefined
+                ? toBigIntMinor(rawBody.input.revisedShippingBaseAmount)
+                : undefined,
+            lineMutations: rawBody.input.lineMutations.map((m) => {
+              const rawMut = m as unknown as Record<string, unknown>;
+              return {
+                ...m,
+                quantity: Number(rawMut["quantity"] ?? rawMut["newQuantity"] ?? 0),
+                baseUnitPrice:
+                  m.baseUnitPrice !== undefined ? toBigIntMinor(m.baseUnitPrice) : undefined,
+              };
+            }),
+          };
+          const editRes = await rpcClient.orders.edit({
+            idempotencyKey: rawBody.idempotencyKey,
+            input: normalizedEditInput,
+          });
+          return jsonResponse({ ok: true, data: editRes });
+        }
+        case "orders.listEdits": {
+          const edits = await rpcClient.orders.listEdits({
+            orderId: typeof body["orderId"] === "string" ? body["orderId"] : undefined,
+            limit: typeof body["limit"] === "number" ? body["limit"] : undefined,
+          });
+          return jsonResponse({ ok: true, data: edits });
+        }
+        case "customers.list": {
+          const customers = await rpcClient.customers.list(
+            typeof body["limit"] === "number" ? body["limit"] : 50
+          );
+          return jsonResponse({ ok: true, data: customers });
+        }
+        case "customers.addStoreCredit": {
+          const raw = body as Record<string, unknown>;
+          const credit = await rpcClient.customers.addStoreCredit({
+            customerId: String(raw["customerId"]),
+            amount: toBigIntMinor(raw["amount"]),
+            currencyCode:
+              typeof raw["currencyCode"] === "string" ? raw["currencyCode"] : undefined,
+            reason: String(raw["reason"] ?? "ADMIN_ADJUSTMENT"),
+            referenceType:
+              typeof raw["referenceType"] === "string" ? raw["referenceType"] : undefined,
+            referenceId:
+              typeof raw["referenceId"] === "string" ? raw["referenceId"] : undefined,
+          });
+          return jsonResponse({ ok: true, data: credit });
+        }
+        case "customers.register": {
+          const raw = body as Record<string, unknown>;
+          const reg = await rpcClient.customers.register({
+            customerId: typeof raw["customerId"] === "string" ? raw["customerId"] : undefined,
+            email: String(raw["email"] ?? ""),
+            passwordPlain: String(raw["passwordPlain"] ?? raw["password"] ?? ""),
+            fullName: String(raw["fullName"] ?? ""),
+            defaultChannelSlug:
+              typeof raw["defaultChannelSlug"] === "string"
+                ? raw["defaultChannelSlug"]
+                : undefined,
+            currencyCode:
+              typeof raw["currencyCode"] === "string" ? raw["currencyCode"] : undefined,
+            guestCartId:
+              typeof raw["guestCartId"] === "string" ? raw["guestCartId"] : undefined,
+          });
+          return jsonResponse({ ok: true, data: reg });
+        }
+        case "customers.login": {
+          const raw = body as Record<string, unknown>;
+          const login = await rpcClient.customers.login({
+            email: String(raw["email"] ?? ""),
+            passwordPlain: String(raw["passwordPlain"] ?? raw["password"] ?? ""),
+            guestCartId:
+              typeof raw["guestCartId"] === "string" ? raw["guestCartId"] : undefined,
+          });
+          return jsonResponse({ ok: login.ok, data: login }, login.ok ? 200 : 401);
+        }
+        case "customers.saveAddress": {
+          const addr = await rpcClient.customers.saveAddress(
+            body as unknown as SaveCustomerAddressInput
+          );
+          return jsonResponse({ ok: true, data: addr });
+        }
+        case "customers.listAddresses": {
+          const addrs = await rpcClient.customers.listAddresses(String(body["customerId"] ?? ""));
+          return jsonResponse({ ok: true, data: addrs });
+        }
+        case "carts.createOrGet": {
+          const raw = body as Record<string, unknown>;
+          const cart = await rpcClient.carts.createOrGet({
+            cartId: typeof raw["cartId"] === "string" ? raw["cartId"] : undefined,
+            channelSlug: String(raw["channelSlug"] ?? "us-retail"),
+            currencyCode: typeof raw["currencyCode"] === "string" ? raw["currencyCode"] : undefined,
+            taxMode: raw["taxMode"] === "TAX_INCLUSIVE" ? "TAX_INCLUSIVE" : "TAX_EXCLUSIVE",
+            customerId: typeof raw["customerId"] === "string" ? raw["customerId"] : undefined,
+            guestToken: typeof raw["guestToken"] === "string" ? raw["guestToken"] : undefined,
+            shippingBaseAmount:
+              raw["shippingBaseAmount"] !== undefined
+                ? toBigIntMinor(raw["shippingBaseAmount"])
+                : undefined,
+            shippingTaxRateBps:
+              typeof raw["shippingTaxRateBps"] === "number"
+                ? raw["shippingTaxRateBps"]
+                : undefined,
+          });
+          return jsonResponse({ ok: true, data: cart });
+        }
+        case "carts.get": {
+          const cart = await rpcClient.carts.get(String(body["cartId"] ?? ""));
+          if (!cart) return jsonResponse({ ok: false, error: "Cart not found" }, 404);
+          return jsonResponse({ ok: true, data: cart });
+        }
+        case "carts.listRecent": {
+          const carts = await rpcClient.carts.listRecent(
+            typeof body["limit"] === "number" ? body["limit"] : undefined
+          );
+          return jsonResponse({ ok: true, data: carts });
+        }
+        case "carts.upsertLine": {
+          const raw = body as Record<string, unknown>;
+          const updatedCart = await rpcClient.carts.upsertLine({
+            cartId: String(raw["cartId"]),
+            variantId: String(raw["variantId"]),
+            sku: String(raw["sku"] ?? raw["variantId"]),
+            title: String(raw["title"] ?? raw["variantId"]),
+            quantity: Number(raw["quantity"] ?? 1),
+            baseUnitPrice: toBigIntMinor(raw["baseUnitPrice"] ?? "0"),
+            taxRateBps: Number(raw["taxRateBps"] ?? 0),
+          });
+          return jsonResponse({ ok: true, data: updatedCart });
+        }
+        case "carts.applyVoucher": {
+          const raw = body as Record<string, unknown>;
+          const vdRaw = raw["voucherDiscount"] as Record<string, unknown> | null | undefined;
+          const vdVal = vdRaw?.["value"] as Record<string, unknown> | undefined;
+          const updatedCart = await rpcClient.carts.applyVoucher({
+            cartId: String(raw["cartId"]),
+            voucherCode:
+              typeof raw["voucherCode"] === "string" ? raw["voucherCode"] : null,
+            voucherDiscount: vdRaw
+              ? {
+                  discountId: String(vdRaw["discountId"] ?? "voucher"),
+                  name: String(vdRaw["name"] ?? "Voucher"),
+                  kind: "ORDER_VOUCHER",
+                  value:
+                    vdVal?.["type"] === "FIXED"
+                      ? { type: "FIXED", amount: toBigIntMinor(vdVal["amount"]) }
+                      : { type: "PERCENTAGE", bps: Number(vdVal?.["bps"] ?? 0) },
+                }
+              : null,
+          });
+          return jsonResponse({ ok: true, data: updatedCart });
+        }
+        case "carts.mergeGuestCart": {
+          const merged = await rpcClient.carts.mergeGuestCart({
+            guestCartId: String(body["guestCartId"]),
+            customerId: String(body["customerId"]),
+          });
+          return jsonResponse({ ok: true, data: merged });
+        }
+        case "payments.createIntent": {
+          const raw = body as Record<string, unknown>;
+          const pi = await rpcClient.payments.createIntent({
+            idempotencyKey: String(raw["idempotencyKey"]),
+            checkoutId: String(raw["checkoutId"]),
+            orderId: typeof raw["orderId"] === "string" ? raw["orderId"] : undefined,
+            customerId: typeof raw["customerId"] === "string" ? raw["customerId"] : undefined,
+            channelSlug: String(raw["channelSlug"] ?? "us-retail"),
+            currencyCode: String(raw["currencyCode"] ?? "USD"),
+            amount: toBigIntMinor(raw["amount"] ?? "0"),
+            captureMethod: raw["captureMethod"] === "manual" ? "manual" : "automatic",
+            paymentMethodToken:
+              typeof raw["paymentMethodToken"] === "string"
+                ? raw["paymentMethodToken"]
+                : undefined,
+            confirmImmediately:
+              typeof raw["confirmImmediately"] === "boolean"
+                ? raw["confirmImmediately"]
+                : undefined,
+          });
+          return jsonResponse({ ok: true, data: pi });
+        }
+        case "payments.complete3ds": {
+          const pi = await rpcClient.payments.complete3ds(String(body["paymentIntentId"]));
+          return jsonResponse({ ok: true, data: pi });
+        }
+        case "payments.captureIntent": {
+          const pi = await rpcClient.payments.captureIntent({
+            paymentIntentId: String(body["paymentIntentId"]),
+            amountToCapture:
+              body["amountToCapture"] !== undefined
+                ? toBigIntMinor(body["amountToCapture"])
+                : undefined,
+          });
+          return jsonResponse({ ok: true, data: pi });
+        }
+        case "payments.listRecent": {
+          const intents = await rpcClient.payments.listRecent(
+            typeof body["limit"] === "number" ? body["limit"] : undefined
+          );
+          return jsonResponse({ ok: true, data: intents });
+        }
+        case "inventory.listSlots": {
+          const slots = await rpcClient.inventory.listSlots(
+            typeof body["limit"] === "number" ? body["limit"] : 100
+          );
+          return jsonResponse({ ok: true, data: slots });
+        }
+        case "outbox.listPending": {
+          const evts = await rpcClient.outbox.listPending(
+            typeof body["limit"] === "number" ? body["limit"] : 50
+          );
+          return jsonResponse({ ok: true, data: evts });
         }
         case "ledger.getTrialBalance": {
           const tb = await rpcClient.ledger.getTrialBalance({
@@ -609,12 +1042,14 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         }
         case "checkout.complete": {
           try {
-            const chkRes = await rpcClient.checkout.complete(
-              body as unknown as {
-                idempotencyKey: string;
-                input: CompleteCheckoutInput;
-              }
-            );
+            const rawBody = body as unknown as {
+              idempotencyKey: string;
+              input: CompleteCheckoutInput;
+            };
+            const chkRes = await rpcClient.checkout.complete({
+              idempotencyKey: rawBody.idempotencyKey,
+              input: normalizeCheckoutInputFromJson(rawBody.input),
+            });
             return jsonResponse({ ok: true, data: chkRes });
           } catch (err) {
             if (err instanceof WorkflowConcurrentExecutionError) {
@@ -662,12 +1097,17 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
           return jsonResponse({ ok: true, data: pos });
         }
         case "b2b.submitPo": {
-          const poRes = await rpcClient.b2b.submitPo(
-            body as unknown as {
-              idempotencyKey: string;
-              input: SubmitB2bPurchaseOrderInput;
-            }
-          );
+          const rawBody = body as unknown as {
+            idempotencyKey: string;
+            input: SubmitB2bPurchaseOrderInput;
+          };
+          const poRes = await rpcClient.b2b.submitPo({
+            idempotencyKey: rawBody.idempotencyKey,
+            input: {
+              ...rawBody.input,
+              cart: normalizeCartInputFromJson(rawBody.input.cart),
+            },
+          });
           return jsonResponse({ ok: true, data: poRes });
         }
         case "b2b.decidePo": {
@@ -776,6 +1216,9 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
     rpcClient,
     ordersRepo,
     subledger,
+    customerCartService,
+    paymentIntentService,
+    orderEditWorkflow,
     workflowStore,
     sagaRecoveryWorker,
     outboxService,

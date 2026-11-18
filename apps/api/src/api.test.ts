@@ -1446,4 +1446,255 @@ describe("Multi-route Merchant Backoffice", () => {
       await prod.close();
     }
   });
+
+  it("executes HTTP v0.3.0 C-end auth, persistent cart merge, 3DS PaymentIntent, checkout, and OMS pre-fulfillment Order Editing", async () => {
+    const pg = new OfflinePgPool();
+    const gw = createSuperCommerceGateway({ pgPool: pg });
+    await gw.ready();
+    await gw.inventoryService.upsertExternalSlots([
+      {
+        warehouseId: "WH-V030",
+        priorityRank: 1,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "SKU-V030-A",
+        quantityOnHand: 15,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+      {
+        warehouseId: "WH-V030",
+        priorityRank: 1,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "SKU-V030-B",
+        quantityOnHand: 10,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+    ]);
+
+    // 1. CORS OPTIONS preflight
+    const preflight = await gw.fetch(
+      new Request("http://localhost/rpc/orders.list", { method: "OPTIONS" })
+    );
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), "*");
+
+    // 2. Guest cart creation + line upsert over HTTP
+    const guestCartRes = await gw.fetch(
+      new Request("http://localhost/rpc/carts.createOrGet", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          channelSlug: "us-retail",
+          guestToken: "gtok_http_01",
+          shippingBaseAmount: "500",
+          shippingTaxRateBps: 0,
+        }),
+      })
+    );
+    const guestCartJson = (await guestCartRes.json()) as {
+      ok: boolean;
+      data: { cartId: string };
+    };
+    assert.equal(guestCartJson.ok, true);
+    const guestCartId = guestCartJson.data.cartId;
+
+    await gw.fetch(
+      new Request("http://localhost/rpc/carts.upsertLine", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          cartId: guestCartId,
+          variantId: "SKU-V030-A",
+          sku: "SKU-V030-A",
+          title: "Kronos Studio Monitor",
+          quantity: 2,
+          baseUnitPrice: "10000",
+          taxRateBps: 1000,
+        }),
+      })
+    );
+
+    // 3. Register C-end customer + login with guestCartId -> atomic merge
+    const regRes = await gw.fetch(
+      new Request("http://localhost/rpc/customers.register", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          email: "claire@v030.example",
+          password: "Claire!StrongPassword2026",
+          fullName: "Claire Moreau",
+        }),
+      })
+    );
+    const regJson = (await regRes.json()) as {
+      ok: boolean;
+      data: { customer: { customerId: string } };
+    };
+    assert.equal(regJson.ok, true);
+    const customerId = regJson.data.customer.customerId;
+
+    const loginRes = await gw.fetch(
+      new Request("http://localhost/rpc/customers.login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          email: "claire@v030.example",
+          password: "Claire!StrongPassword2026",
+          guestCartId,
+        }),
+      })
+    );
+    assert.equal(loginRes.status, 200);
+    const loginJson = (await loginRes.json()) as {
+      ok: boolean;
+      data: {
+        ok: boolean;
+        mergedCart: { cartId: string; pricing: { totalGrossAmount: string } };
+      };
+    };
+    assert.equal(loginJson.data.ok, true);
+    assert.equal(loginJson.data.mergedCart.pricing.totalGrossAmount, "22500");
+
+    // 4. Create 3DS PaymentIntent -> complete 3DS challenge -> complete checkout
+    const piCreateRes = await gw.fetch(
+      new Request("http://localhost/rpc/payments.createIntent", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "http-pi-3ds-1",
+          checkoutId: "chk-http-v030-1",
+          customerId,
+          channelSlug: "us-retail",
+          currencyCode: "USD",
+          amount: "22500",
+          captureMethod: "automatic",
+          paymentMethodToken: "pm_card_3ds_challenge",
+          confirmImmediately: true,
+        }),
+      })
+    );
+    const piCreateJson = (await piCreateRes.json()) as {
+      ok: boolean;
+      data: { paymentIntentId: string; status: string };
+    };
+    assert.equal(piCreateJson.data.status, "requires_action");
+    const piId = piCreateJson.data.paymentIntentId;
+
+    const pi3dsRes = await gw.fetch(
+      new Request("http://localhost/rpc/payments.complete3ds", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paymentIntentId: piId }),
+      })
+    );
+    const pi3dsJson = (await pi3dsRes.json()) as {
+      ok: boolean;
+      data: { status: string; amountReceived: string };
+    };
+    assert.equal(pi3dsJson.data.status, "succeeded");
+    assert.equal(pi3dsJson.data.amountReceived, "22500");
+
+    const chkRes = await gw.fetch(
+      new Request("http://localhost/rpc/checkout.complete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "http-chk-v030-1",
+          input: {
+            checkoutId: "chk-http-v030-1",
+            channelSlug: "us-retail",
+            customerId,
+            stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+            allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+            paymentToken: piId,
+            expectedTotalGrossAmount: "22500",
+            cart: {
+              currencyCode: "USD",
+              taxMode: "TAX_EXCLUSIVE",
+              shippingBaseAmount: "500",
+              shippingTaxRateBps: 0,
+              lines: [
+                {
+                  lineId: "L-A",
+                  variantId: "SKU-V030-A",
+                  quantity: 2,
+                  baseUnitPrice: "10000",
+                  taxRateBps: 1000,
+                },
+              ],
+            },
+          },
+        }),
+      })
+    );
+    assert.equal(chkRes.status, 200);
+    const chkJson = (await chkRes.json()) as {
+      ok: boolean;
+      data: { status: string; output: { orderId: string } };
+    };
+    assert.equal(chkJson.data.status, "COMPLETED");
+    const orderId = chkJson.data.output.orderId;
+
+    // 5. OMS Pre-Fulfillment Order Edit over HTTP: add 1x SKU-V030-B ($50 + 10% tax = $55 = 5500c delta)
+    const editRes = await gw.fetch(
+      new Request("http://localhost/rpc/orders.edit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "http-oms-edit-1",
+          input: {
+            editId: "oe_http_1",
+            orderId,
+            editedBy: "admin@kronos.io",
+            reason: "Customer requested stand bundle before dispatch",
+            paymentTokenForIncrementalCapture: "pm_card_visa_incremental",
+            lineMutations: [
+              {
+                lineId: "L-B",
+                variantId: "SKU-V030-B",
+                quantity: 1,
+                baseUnitPrice: "5000",
+                taxRateBps: 1000,
+              },
+            ],
+          },
+        }),
+      })
+    );
+    assert.equal(editRes.status, 200);
+    const editJson = (await editRes.json()) as {
+      ok: boolean;
+      data: {
+        status: string;
+        output: {
+          deltaGrossAmount: string;
+          revisedGrossAmount: string;
+          settlementKind: string;
+        };
+      };
+    };
+    assert.equal(editJson.data.status, "COMPLETED");
+    assert.equal(editJson.data.output.deltaGrossAmount, "5500");
+    assert.equal(editJson.data.output.revisedGrossAmount, "28000");
+    assert.equal(editJson.data.output.settlementKind, "INCREMENTAL_CAPTURE");
+
+    // Verify Double-Entry Subledger remains balanced after checkout + OMS Order Edit
+    const tbRes = await gw.fetch(
+      new Request("http://localhost/rpc/ledger.getTrialBalance", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ currencyCode: "USD" }),
+      })
+    );
+    const tbJson = (await tbRes.json()) as {
+      ok: boolean;
+      data: { isBalanced: boolean; grandTotalDebits: string; grandTotalCredits: string };
+    };
+    assert.equal(tbJson.data.isBalanced, true);
+    assert.equal(tbJson.data.grandTotalDebits, "28000");
+    assert.equal(tbJson.data.grandTotalCredits, "28000");
+  });
 });

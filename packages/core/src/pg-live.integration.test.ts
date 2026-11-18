@@ -12,13 +12,18 @@ import { PgPool, runMigrations } from "@super-ecommerce/db";
 import { PgWorkflowStateStore } from "@super-ecommerce/workflow";
 import {
   buildCompleteCheckoutWorkflow,
+  buildEditOrderWorkflow,
   buildProcessReturnRefundWorkflow,
+  listOrderEditsFromPg,
   OutboxRelayWorker,
   PgAdminAuthRbacService,
   PgB2bOrganizationService,
+  PgCustomerAuthAndCartService,
   PgCustomersService,
+  PgDoubleEntryLedgerService,
   PgMsiInventoryService,
   PgReservationTtlReaperService,
+  PgStripePaymentIntentService,
   PgStripeWebhookService,
   PgTransactionalOutboxService,
   signStripeWebhookPayload,
@@ -32,6 +37,15 @@ async function resetTransactionalTables(pool: PgPool): Promise<void> {
     TRUNCATE TABLE
       workflow_step_logs,
       workflow_runs,
+      order_edits,
+      payment_intents,
+      cart_lines,
+      carts,
+      customer_addresses,
+      customer_credentials,
+      ledger_postings,
+      ledger_journal_entries,
+      order_lines,
       order_returns,
       order_fulfillment_lines,
       order_fulfillments,
@@ -39,6 +53,8 @@ async function resetTransactionalTables(pool: PgPool): Promise<void> {
       transactional_outbox_events,
       inbound_webhook_events,
       msi_stock_reservations,
+      msi_stock_shards,
+      catalog_availability_hot,
       msi_stock_slots,
       reservation_reaper_audit,
       b2b_purchase_orders,
@@ -90,6 +106,7 @@ describe("PostgreSQL 17 Live Integration Suite (PgPool Wire Protocol)", () => {
     assert.ok(secondRun.alreadyAppliedVersions.includes("0002"));
     assert.ok(secondRun.alreadyAppliedVersions.includes("0003"));
     assert.ok(secondRun.alreadyAppliedVersions.includes("0004"));
+    assert.ok(secondRun.alreadyAppliedVersions.includes("0005"));
 
     // Confirm production GIN and partial indexes exist in pg_indexes
     const idxRes = await pool.query<{ indexname: string }>(
@@ -558,5 +575,146 @@ describe("PostgreSQL 17 Live Integration Suite (PgPool Wire Protocol)", () => {
     assert.equal(createdRole.roleSlug, "PG17_AUDITOR");
     const roles = await rbac.listRoles();
     assert.ok(roles.some((r) => r.roleSlug === "PG17_AUDITOR"));
+  });
+
+  it("executes C-end customer auth, persistent cart merge, Stripe PaymentIntent 3DS/manual-capture, and OMS Order Editing on real PostgreSQL", async () => {
+    await resetTransactionalTables(pool);
+
+    const wfStore = new PgWorkflowStateStore(pool);
+    const inv = new PgMsiInventoryService(pool);
+    const outbox = new PgTransactionalOutboxService(pool);
+    const custCartSvc = new PgCustomerAuthAndCartService(pool);
+    const piSvc = new PgStripePaymentIntentService({ pool });
+    const subledger = new PgDoubleEntryLedgerService(pool);
+
+    await inv.upsertExternalSlots([
+      {
+        warehouseId: "WH-PG17-OMS",
+        priorityRank: 1,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "SKU-PG17-OMS-1",
+        quantityOnHand: 12,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+    ]);
+
+    const guestCart = await custCartSvc.createOrGetActiveCart({
+      channelSlug: "us-retail",
+      guestToken: "gtok_pg17_live",
+      shippingBaseAmount: 0n,
+      shippingTaxRateBps: 0,
+    });
+    await custCartSvc.upsertCartLine({
+      cartId: guestCart.cartId,
+      variantId: "SKU-PG17-OMS-1",
+      sku: "SKU-PG17-OMS-1",
+      title: "PG17 Live DAC",
+      quantity: 2,
+      baseUnitPrice: 15_000n,
+      taxRateBps: 1000,
+    });
+
+    const reg = await custCartSvc.registerCustomer({
+      email: "lena@pg17.example",
+      passwordPlain: "Lena!Pg17Password2026",
+      fullName: "Lena Lindqvist",
+    });
+    await custCartSvc.saveAddress({
+      customerId: reg.customer.customerId,
+      recipientName: "Lena Lindqvist",
+      line1: "42 Sveavagen",
+      city: "Stockholm",
+      postalCode: "11157",
+      countryCode: "SE",
+      isDefaultShipping: true,
+    });
+    const login = await custCartSvc.authenticateCustomer({
+      email: "lena@pg17.example",
+      passwordPlain: "Lena!Pg17Password2026",
+      guestCartId: guestCart.cartId,
+    });
+    assert.equal(login.ok, true);
+    assert.equal(login.mergedCart?.pricing.totalGrossAmount, 33_000n);
+
+    // Manual-capture PaymentIntent -> capture -> checkout -> OMS Order Edit down by 1 unit
+    const piManual = await piSvc.createPaymentIntent({
+      idempotencyKey: "pg17-pi-manual-1",
+      checkoutId: "chk_pg17_oms_1",
+      customerId: reg.customer.customerId,
+      channelSlug: "us-retail",
+      currencyCode: "USD",
+      amount: 33_000n,
+      captureMethod: "manual",
+      paymentMethodToken: "pm_card_visa_manual",
+      confirmImmediately: true,
+    });
+    assert.equal(piManual.status, "requires_capture");
+
+    const checkoutWf = buildCompleteCheckoutWorkflow({
+      inventoryService: inv,
+      paymentGateway: piSvc.asPaymentGatewayStrategy(),
+      outboxService: outbox,
+      pgPool: pool,
+    });
+    const chk = await checkoutWf.execute(
+      {
+        checkoutId: "chk_pg17_oms_1",
+        channelSlug: "us-retail",
+        customerId: reg.customer.customerId,
+        stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+        allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+        paymentToken: piManual.paymentIntentId,
+        expectedTotalGrossAmount: 33_000n,
+        cart: {
+          currencyCode: "USD",
+          taxMode: "TAX_EXCLUSIVE",
+          shippingBaseAmount: 0n,
+          shippingTaxRateBps: 0,
+          lines: [
+            {
+              lineId: "L-OMS-1",
+              variantId: "SKU-PG17-OMS-1",
+              quantity: 2,
+              baseUnitPrice: 15_000n,
+              taxRateBps: 1000,
+            },
+          ],
+        },
+      },
+      { idempotencyKey: "idem_pg17_oms_chk_1", store: wfStore }
+    );
+    assert.equal(chk.status, "COMPLETED");
+    const orderId = chk.output!.orderId;
+
+    const editWf = buildEditOrderWorkflow({
+      pgPool: pool,
+      inventoryService: inv,
+      paymentGateway: piSvc.asPaymentGatewayStrategy(),
+      outboxService: outbox,
+    });
+    const edited = await editWf.execute(
+      {
+        editId: "oe_pg17_live_1",
+        orderId,
+        editedBy: "admin@kronos.io",
+        reason: "Reduce quantity from 2 to 1 prior to warehouse pick",
+        lineMutations: [{ lineId: "L-OMS-1", quantity: 1 }],
+      },
+      { idempotencyKey: "idem_pg17_oms_edit_1", store: wfStore }
+    );
+    assert.equal(edited.status, "COMPLETED");
+    assert.equal(edited.output!.deltaGrossAmount, -16_500n);
+    assert.equal(edited.output!.settlementKind, "PARTIAL_REFUND");
+    assert.equal((await inv.getSlot("WH-PG17-OMS", "SKU-PG17-OMS-1"))?.quantityAllocated, 1);
+
+    const edits = await listOrderEditsFromPg(pool, { orderId });
+    assert.equal(edits.length, 1);
+
+    const tb = await subledger.getTrialBalance("USD");
+    assert.equal(tb.isBalanced, true);
+    assert.equal(tb.grandTotalDebits, 49_500n);
+    assert.equal(tb.grandTotalCredits, 49_500n);
   });
 });

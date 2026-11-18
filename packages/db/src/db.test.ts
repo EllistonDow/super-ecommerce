@@ -535,11 +535,11 @@ describe("@super-ecommerce/db", () => {
     const pg = new OfflinePgPool();
     try {
       const firstRun = await runMigrations(pg);
-      assert.deepEqual(firstRun.appliedVersions, ["0001", "0002", "0003", "0004"]);
+      assert.deepEqual(firstRun.appliedVersions, ["0001", "0002", "0003", "0004", "0005"]);
 
       const secondRun = await runMigrations(pg);
       assert.deepEqual(secondRun.appliedVersions, []);
-      assert.deepEqual(secondRun.alreadyAppliedVersions, ["0001", "0002", "0003", "0004"]);
+      assert.deepEqual(secondRun.alreadyAppliedVersions, ["0001", "0002", "0003", "0004", "0005"]);
 
       // 1. CHECK constraint rollback on msi_stock_slots
       await pg.query(

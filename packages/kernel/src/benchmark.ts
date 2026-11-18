@@ -203,13 +203,16 @@ export async function runKernelBenchmarkSuite(options?: {
     calculateCart(sampleCart);
   }
 
-  const napiCartIters = Math.max(500, Math.round(5_000 * scale));
+  const napiCartIters = Math.max(1_000, Math.round(5_000 * scale));
+  const napiCartBatch = 10;
   const napiCartSamplesNs: bigint[] = [];
   const napiCartStart = process.hrtime.bigint();
-  for (let i = 0; i < napiCartIters; i++) {
+  for (let i = 0; i < napiCartIters; i += napiCartBatch) {
     const t0 = process.hrtime.bigint();
-    calculateCart(sampleCart);
-    napiCartSamplesNs.push(process.hrtime.bigint() - t0);
+    for (let j = 0; j < napiCartBatch; j++) {
+      calculateCart(sampleCart);
+    }
+    napiCartSamplesNs.push((process.hrtime.bigint() - t0) / BigInt(napiCartBatch));
   }
   const napiCartTotalNs = process.hrtime.bigint() - napiCartStart;
   const napiCartTotalMs = Number(napiCartTotalNs) / 1_000_000;
@@ -234,13 +237,16 @@ export async function runKernelBenchmarkSuite(options?: {
     { id: "line-5", weight: 7500n },
   ];
   const tsProRataIters = Math.max(1_000, Math.round(15_000 * scale));
+  const tsBatch = 10;
   const tsSamplesNs: bigint[] = [];
   const tsStart = process.hrtime.bigint();
-  for (let i = 0; i < tsProRataIters; i++) {
+  for (let i = 0; i < tsProRataIters; i += tsBatch) {
     const t0 = process.hrtime.bigint();
-    allocateProRataIsomorphic(1000n, proRataItems);
-    allocateProRata(1000n, proRataItems);
-    tsSamplesNs.push((process.hrtime.bigint() - t0) / 2n);
+    for (let j = 0; j < tsBatch; j++) {
+      allocateProRataIsomorphic(1000n, proRataItems);
+      allocateProRata(1000n, proRataItems);
+    }
+    tsSamplesNs.push((process.hrtime.bigint() - t0) / BigInt(tsBatch * 2));
   }
   const tsTotalNs = process.hrtime.bigint() - tsStart;
   const tsTotalMs = Number(tsTotalNs) / 1_000_000;
