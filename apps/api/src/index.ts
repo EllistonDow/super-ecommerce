@@ -13,6 +13,9 @@
  * - `POST /webhooks/stripe`   -> Constant-time HMAC-SHA256 webhook verifier
  */
 
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, extname, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   calculateCart,
   type CartCalculationInput,
@@ -154,6 +157,69 @@ const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers": "content-type, authorization, stripe-signature",
 };
+
+const ADMIN_SPA_DIST_DIR = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../admin-spa/dist"
+);
+
+const MIME_BY_EXT: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+};
+
+function tryServeAdminSpaStatic(pathname: string): Response | null {
+  if (pathname !== "/admin-spa" && !pathname.startsWith("/admin-spa/")) {
+    return null;
+  }
+  if (!existsSync(ADMIN_SPA_DIST_DIR)) {
+    return null;
+  }
+
+  const subPath = pathname.slice("/admin-spa".length).replace(/^\/+/, "");
+  if (subPath.length > 0) {
+    const candidate = resolve(ADMIN_SPA_DIST_DIR, subPath);
+    if (!candidate.startsWith(ADMIN_SPA_DIST_DIR + sep)) {
+      return new Response("Forbidden", { status: 403 });
+    }
+    if (existsSync(candidate) && statSync(candidate).isFile()) {
+      const ext = extname(candidate).toLowerCase();
+      const body = readFileSync(candidate);
+      const isImmutableAsset = subPath.startsWith("assets/");
+      return new Response(new Uint8Array(body), {
+        status: 200,
+        headers: {
+          "content-type": MIME_BY_EXT[ext] ?? "application/octet-stream",
+          "cache-control": isImmutableAsset
+            ? "public, max-age=31536000, immutable"
+            : "no-cache",
+        },
+      });
+    }
+    // Missing asset extension -> 404 instead of HTML fallback
+    if (extname(subPath)) {
+      return new Response("Not Found", { status: 404 });
+    }
+  }
+
+  const indexHtmlPath = resolve(ADMIN_SPA_DIST_DIR, "index.html");
+  if (!existsSync(indexHtmlPath)) {
+    return null;
+  }
+  return new Response(new Uint8Array(readFileSync(indexHtmlPath)), {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-cache",
+    },
+  });
+}
 
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, jsonReplacer), {
@@ -447,9 +513,10 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
       },
     },
     outbox: {
-      listPending: async (limit?: number) => {
+      listPending: async (limit = 50) => {
         if (!isReady) await ensureReady();
-        return outboxService.listPending(limit);
+        const pending = await outboxService.listPending();
+        return pending.slice(0, Math.max(1, limit));
       },
     },
     ledger: {
@@ -554,6 +621,11 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
     if (!isReady) await ensureReady();
     const url = new URL(req.url);
 
+    if (req.method === "GET" && (url.pathname === "/admin-spa" || url.pathname.startsWith("/admin-spa/"))) {
+      const spaRes = tryServeAdminSpaStatic(url.pathname);
+      if (spaRes) return spaRes;
+    }
+
     if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
       let pgVersion: string | null = null;
       try {
@@ -566,7 +638,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
       }
       return jsonResponse({
         status: "ok",
-        version: "0.3.0",
+        version: "0.4.0",
         engine: "super-ecommerce",
         database: "postgres",
         storage: "postgresql",
@@ -582,9 +654,9 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         openapi: "3.1.0",
         info: {
           title: "Super Ecommerce Headless Commerce Gateway API",
-          version: "0.3.0",
+          version: "0.4.0",
           description:
-            "Zero-float deterministic commerce API powered by Rust commerce-kernel, PostgreSQL 17 Durable Sagas, Double-Entry Subledger, C-End Carts, Stripe PaymentIntents, OMS Order Editing, and Model Context Protocol (MCP).",
+            "Zero-float deterministic commerce API powered by Rust commerce-kernel, PostgreSQL 17 Durable Sagas, Double-Entry Subledger, C-End Carts, Stripe PaymentIntents, OMS Order Editing, React 19 + TanStack Admin SPA, and Model Context Protocol (MCP).",
         },
         paths: {
           "/healthz": { get: { summary: "Database & kernel readiness probe" } },
@@ -945,13 +1017,16 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         }
         case "carts.applyVoucher": {
           const raw = body as Record<string, unknown>;
-          const vdRaw = raw["voucherDiscount"] as Record<string, unknown> | null | undefined;
+          const vdRaw = (raw["discount"] ?? raw["voucherDiscount"]) as
+            | Record<string, unknown>
+            | null
+            | undefined;
           const vdVal = vdRaw?.["value"] as Record<string, unknown> | undefined;
           const updatedCart = await rpcClient.carts.applyVoucher({
             cartId: String(raw["cartId"]),
             voucherCode:
               typeof raw["voucherCode"] === "string" ? raw["voucherCode"] : null,
-            voucherDiscount: vdRaw
+            discount: vdRaw
               ? {
                   discountId: String(vdRaw["discountId"] ?? "voucher"),
                   name: String(vdRaw["name"] ?? "Voucher"),

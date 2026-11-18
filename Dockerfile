@@ -16,7 +16,21 @@ RUN cargo build --release -p kernel-napi --locked \
     && cargo build --release --target wasm32-unknown-unknown -p kernel-wasm --locked
 
 # ==============================================================================
-# Stage 2: Minimal Node 22 Runtime (glibc-matched to rust:1-bookworm)
+# Stage 2: Build Modular React 19 + TanStack Admin SPA (`apps/admin-spa/dist`)
+# ==============================================================================
+FROM node:22-bookworm-slim AS spa-builder
+
+WORKDIR /build
+
+COPY package.json package-lock.json ./
+COPY packages ./packages
+COPY apps ./apps
+
+RUN npm ci --ignore-scripts --no-audit --no-fund \
+    && npm run build:spa
+
+# ==============================================================================
+# Stage 3: Minimal Node 22 Runtime (glibc-matched to rust:1-bookworm)
 # ==============================================================================
 FROM node:22-bookworm-slim AS runtime
 
@@ -31,18 +45,18 @@ ENV NODE_ENV=production \
     SUPER_PG_USER=super \
     SUPER_PG_DB=super_ecommerce
 
-# Copy workspace manifests & TypeScript sources (zero external npm runtime deps)
 COPY package.json package-lock.json ./
 COPY packages ./packages
 COPY apps ./apps
+COPY --from=spa-builder /build/apps/admin-spa/dist /app/apps/admin-spa/dist
 
 # Place freshly compiled Linux native Rust N-API addon & WASM binary for @super-ecommerce/kernel
 RUN mkdir -p /app/packages/kernel/native
 COPY --from=rust-builder /build/target/release/libkernel_napi.so /app/packages/kernel/native/commerce_kernel.node
 COPY --from=rust-builder /build/target/wasm32-unknown-unknown/release/kernel_wasm.wasm /app/packages/kernel/native/commerce_kernel.wasm
 
-# Create npm workspace symlinks (node_modules/@super-ecommerce/*) deterministically
-RUN npm ci --ignore-scripts --no-audit --no-fund \
+# Install production workspace links only (omits Vite/TypeScript build toolchains)
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && chown -R node:node /app
 
 USER node

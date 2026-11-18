@@ -1,8 +1,8 @@
 {
   "name": "super-ecommerce",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "Next-generation full-stack headless commerce engine powered by TypeScript, Rust commerce-kernel, and PostgreSQL 17",
+  "description": "Next-generation full-stack headless commerce engine powered by TypeScript, Rust commerce-kernel, PostgreSQL 17, and React 19 + TanStack Admin SPA",
   "type": "module",
   "workspaces": [
     "packages/*",
@@ -10,15 +10,17 @@
   ],
   "scripts": {
     "dev": "node --experimental-strip-types apps/api/src/dev-server.ts",
+    "dev:spa": "npm run dev --workspace=@super-ecommerce/admin-spa",
+    "build:spa": "npm run build --workspace=@super-ecommerce/admin-spa",
     "start:api": "node --experimental-strip-types apps/api/src/prod-server.ts",
     "start:worker": "node --experimental-strip-types apps/api/src/worker.ts",
     "mcp": "node --experimental-strip-types packages/mcp-server/src/cli.ts",
     "bench": "node --experimental-strip-types packages/kernel/src/benchmark.ts",
     "configurator": "node --experimental-strip-types packages/configurator/src/cli.ts",
     "test:rust": "cargo test --workspace",
-    "test:ts": "node --experimental-strip-types --test packages/kernel/src/kernel.test.ts packages/db/src/db.test.ts packages/workflow/src/workflow.test.ts packages/core/src/core.test.ts packages/plugin-sdk/src/plugin-sdk.test.ts packages/configurator/src/configurator.test.ts packages/mcp-server/src/mcp-server.test.ts apps/api/src/api.test.ts apps/storefront/src/storefront.test.ts apps/admin/src/admin.test.ts",
+    "test:ts": "node --experimental-strip-types --test packages/kernel/src/kernel.test.ts packages/db/src/db.test.ts packages/workflow/src/workflow.test.ts packages/core/src/core.test.ts packages/plugin-sdk/src/plugin-sdk.test.ts packages/configurator/src/configurator.test.ts packages/mcp-server/src/mcp-server.test.ts apps/api/src/api.test.ts apps/storefront/src/storefront.test.ts apps/admin/src/admin.test.ts apps/admin-spa/src/admin-spa.test.ts",
     "test:pg-live": "node --experimental-strip-types --test --test-concurrency=1 packages/core/src/pg-live.integration.test.ts apps/api/src/pg-live-http.integration.test.ts",
-    "test": "npm run test:rust && npm run test:ts"
+    "test": "npm run build:spa && npm run test:rust && npm run test:ts"
   },
   "engines": {
     "node": ">=22.0.0"

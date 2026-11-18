@@ -79,6 +79,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build React 19 + TanStack Admin SPA bundle
+        run: npm run build:spa
+
       - name: Run full-stack TypeScript test suite (zero SQLite)
         run: npm run test:ts
 

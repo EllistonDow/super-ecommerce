@@ -1,0 +1,586 @@
+/* ============================================================================
+   Super Ecommerce — Modular Admin Studio CSS (Modern Web Guidance Compliant)
+   - Adaptive light/dark tokens (`color-scheme`, `@media` fallback, `light-dark()`)
+   - Container-queried responsive & sortable tables (`@container`, `aria-sort`)
+   - Native top-layer modal `<dialog closedby="any">` styling
+   - Interaction-deferred form validation (`:is(:user-invalid, .user-invalid-fallback)`)
+   ============================================================================ */
+
+:root {
+  --bg-canvas-light: #f5f7fa;
+  --bg-canvas-dark: #0b0f17;
+  --surface-card-light: #ffffff;
+  --surface-card-dark: #121826;
+  --surface-elevated-light: #eef2f7;
+  --surface-elevated-dark: #1a2335;
+  --border-subtle-light: #d5dce6;
+  --border-subtle-dark: #263248;
+  --text-primary-light: #0f172a;
+  --text-primary-dark: #f1f5f9;
+  --text-muted-light: #475569;
+  --text-muted-dark: #94a3b8;
+  --brand-light: #0b5fff;
+  --brand-dark: #4f9cff;
+  --brand-contrast-light: #ffffff;
+  --brand-contrast-dark: #061224;
+  --ok-light: #137333;
+  --ok-dark: #4ade80;
+  --warn-light: #b06000;
+  --warn-dark: #fbbf24;
+  --danger-light: #c5221f;
+  --danger-dark: #f87171;
+  --danger-bg-light: #fce8e6;
+  --danger-bg-dark: #3b1418;
+  --scrollbar-track-light: #e8edf4;
+  --scrollbar-track-dark: #111827;
+  --scrollbar-thumb-light: #64748b;
+  --scrollbar-thumb-dark: #64748b;
+
+  /* Baseline fallback before light-dark() */
+  --bg-canvas: var(--bg-canvas-light);
+  --surface-card: var(--surface-card-light);
+  --surface-elevated: var(--surface-elevated-light);
+  --border-subtle: var(--border-subtle-light);
+  --text-primary: var(--text-primary-light);
+  --text-muted: var(--text-muted-light);
+  --brand: var(--brand-light);
+  --brand-contrast: var(--brand-contrast-light);
+  --ok: var(--ok-light);
+  --warn: var(--warn-light);
+  --danger: var(--danger-light);
+  --danger-bg: var(--danger-bg-light);
+  --scrollbar-track: var(--scrollbar-track-light);
+  --scrollbar-thumb: var(--scrollbar-thumb-light);
+
+  @media (prefers-color-scheme: dark) {
+    --bg-canvas: var(--bg-canvas-dark);
+    --surface-card: var(--surface-card-dark);
+    --surface-elevated: var(--surface-elevated-dark);
+    --border-subtle: var(--border-subtle-dark);
+    --text-primary: var(--text-primary-dark);
+    --text-muted: var(--text-muted-dark);
+    --brand: var(--brand-dark);
+    --brand-contrast: var(--brand-contrast-dark);
+    --ok: var(--ok-dark);
+    --warn: var(--warn-dark);
+    --danger: var(--danger-dark);
+    --danger-bg: var(--danger-bg-dark);
+    --scrollbar-track: var(--scrollbar-track-dark);
+    --scrollbar-thumb: var(--scrollbar-thumb-dark);
+  }
+
+  @supports (color: light-dark(white, black)) {
+    --bg-canvas: light-dark(var(--bg-canvas-light), var(--bg-canvas-dark));
+    --surface-card: light-dark(var(--surface-card-light), var(--surface-card-dark));
+    --surface-elevated: light-dark(var(--surface-elevated-light), var(--surface-elevated-dark));
+    --border-subtle: light-dark(var(--border-subtle-light), var(--border-subtle-dark));
+    --text-primary: light-dark(var(--text-primary-light), var(--text-primary-dark));
+    --text-muted: light-dark(var(--text-muted-light), var(--text-muted-dark));
+    --brand: light-dark(var(--brand-light), var(--brand-dark));
+    --brand-contrast: light-dark(var(--brand-contrast-light), var(--brand-contrast-dark));
+    --ok: light-dark(var(--ok-light), var(--ok-dark));
+    --warn: light-dark(var(--warn-light), var(--warn-dark));
+    --danger: light-dark(var(--danger-light), var(--danger-dark));
+    --danger-bg: light-dark(var(--danger-bg-light), var(--danger-bg-dark));
+    --scrollbar-track: light-dark(var(--scrollbar-track-light), var(--scrollbar-track-dark));
+    --scrollbar-thumb: light-dark(var(--scrollbar-thumb-light), var(--scrollbar-thumb-dark));
+  }
+
+  color-scheme: light dark;
+  accent-color: var(--brand);
+  /* Never animate scrollbar-color (WebKit flicker bug 311752) */
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+@supports not (scrollbar-color: auto) {
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+/* Accessible visually hidden status / live announcer */
+.visually-hidden:where(:not(:focus-within, :active)) {
+  position: absolute !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  white-space: nowrap !important;
+}
+
+/* Layout Shell */
+.admin-shell {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  min-block-size: 100dvh;
+}
+
+@media (width < 920px) {
+  .admin-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.admin-sidebar {
+  background: var(--surface-card);
+  border-inline-end: 1px solid var(--border-subtle);
+  padding: 1.25rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.brand-lockup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-inline: 0.5rem;
+}
+
+.brand-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.brand-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.nav-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0.5rem;
+  text-decoration: none;
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  font-weight: 500;
+  min-block-size: 38px;
+}
+
+.nav-link:hover {
+  background: var(--surface-elevated);
+}
+
+.nav-link[aria-current="page"] {
+  background: var(--brand);
+  color: var(--brand-contrast);
+  font-weight: 600;
+}
+
+.nav-link:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.admin-main {
+  padding: 1.5rem 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  max-inline-size: 1440px;
+}
+
+.page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.page-header h1 {
+  margin: 0;
+  font-size: 1.45rem;
+  letter-spacing: -0.02em;
+}
+
+.page-header p {
+  margin: 0.25rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+/* KPI & Panel Cards */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  background: var(--surface-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem;
+  padding: 1.15rem 1.25rem;
+}
+
+.kpi-label {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.kpi-value {
+  margin-block-start: 0.35rem;
+  font-size: 1.45rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.kpi-meta {
+  margin-block-start: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Badges */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+}
+
+.badge-ok {
+  color: var(--ok);
+  border-color: currentColor;
+}
+
+.badge-warn {
+  color: var(--warn);
+  border-color: currentColor;
+}
+
+.badge-danger {
+  color: var(--danger);
+  border-color: currentColor;
+}
+
+/* Buttons */
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-block-size: 36px;
+  padding: 0.45rem 0.85rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-elevated);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background: var(--brand);
+  color: var(--brand-contrast);
+  border-color: transparent;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Responsive & Sortable Data Tables (`responsive-table` + `sortable-table`) */
+.table-wrapper {
+  overflow: auto;
+  max-inline-size: 100%;
+  max-block-size: min(560px, 78vh);
+  container-type: inline-size;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.75rem;
+  background: var(--surface-card);
+}
+
+.data-table {
+  inline-size: 100%;
+  min-inline-size: 640px;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.875rem;
+}
+
+.data-table caption {
+  text-align: start;
+  padding: 0.85rem 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  border-block-end: 1px solid var(--border-subtle);
+}
+
+.data-table thead {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 2;
+  background: var(--surface-elevated);
+}
+
+.data-table th,
+.data-table td {
+  padding: 0.65rem 0.9rem;
+  text-align: start;
+  border-block-end: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+
+.data-table thead th {
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  font-weight: 600;
+  background: var(--surface-elevated);
+}
+
+/* Drop cell padding ONLY when header contains sort button (`sortable-table`) */
+.data-table thead th:has(> button) {
+  padding: 0;
+}
+
+.sort-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  inline-size: 100%;
+  min-block-size: 36px;
+  padding: 0.65rem 0.9rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.sort-icon {
+  opacity: 0.35;
+  font-size: 0.75rem;
+}
+
+.data-table thead th[aria-sort="ascending"] .sort-icon,
+.data-table thead th[aria-sort="descending"] .sort-icon {
+  opacity: 1;
+  color: var(--brand);
+}
+
+.data-table thead th[aria-sort="descending"] .sort-icon {
+  transform: rotate(180deg);
+}
+
+.data-table tbody th {
+  position: sticky;
+  inset-inline-start: 0;
+  z-index: 1;
+  background: var(--surface-card);
+  font-weight: 600;
+}
+
+@container (width < 600px) {
+  .data-table {
+    min-inline-size: 100%;
+  }
+  .data-table,
+  .data-table tbody,
+  .data-table tr,
+  .data-table th,
+  .data-table td {
+    display: block;
+    white-space: normal;
+  }
+  .data-table thead {
+    display: none;
+  }
+  .data-table tr {
+    margin: 0.75rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.5rem;
+  }
+  .data-table tbody th {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 2;
+    background: var(--surface-elevated);
+  }
+  .data-table td:nth-child(2)::before {
+    content: var(--col-2, "") ": ";
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  .data-table td:nth-child(3)::before {
+    content: var(--col-3, "") ": ";
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  .data-table td:nth-child(4)::before {
+    content: var(--col-4, "") ": ";
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  .data-table td:nth-child(5)::before {
+    content: var(--col-5, "") ": ";
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+}
+
+/* Native Modal Dialog (`light-dismiss-a-dialog`) */
+dialog.oms-dialog {
+  inline-size: min(640px, 94vw);
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.85rem;
+  background: var(--surface-card);
+  color: var(--text-primary);
+  padding: 1.5rem;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+
+dialog.oms-dialog::backdrop {
+  background-color: rgba(8, 12, 22, 0.62);
+  backdrop-filter: blur(3px);
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-block-end: 1rem;
+}
+
+.dialog-header h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+/* Forms & Interaction-Deferred Validation (`validate-input-after-interaction`) */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.9rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.field label {
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.field .hint {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.field input,
+.field select,
+.field textarea {
+  min-block-size: 36px;
+  padding: 0.45rem 0.65rem;
+  border-radius: 0.45rem;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-size: 0.88rem;
+}
+
+.field .error-msg {
+  display: none;
+  font-size: 0.8rem;
+  color: var(--danger);
+  margin-block-start: 0.2rem;
+}
+
+.field :is(input, select, textarea):is(:user-invalid, .user-invalid-fallback) {
+  border-color: var(--danger);
+  background-color: var(--danger-bg);
+}
+
+.field :is(input, select, textarea):is(:user-invalid, .user-invalid-fallback) + .error-msg {
+  display: block;
+}
+
+.field :is(input, select, textarea):user-valid {
+  border-color: var(--ok);
+}
+
+.code-block {
+  color-scheme: dark;
+  accent-color: var(--brand);
+  background: #0d1320;
+  color: #e2e8f0;
+  padding: 0.9rem 1rem;
+  border-radius: 0.55rem;
+  overflow: auto;
+  font-size: 0.8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

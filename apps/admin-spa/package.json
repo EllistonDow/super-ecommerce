@@ -1,0 +1,27 @@
+{
+  "name": "@super-ecommerce/admin-spa",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular React 19 + TanStack (Router, Query, Table) Merchant Backoffice & OMS Studio",
+  "scripts": {
+    "dev": "vite --port 5174",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test src/admin-spa.test.ts"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.76.0",
+    "@tanstack/react-router": "^1.120.0",
+    "@tanstack/react-table": "^8.21.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}
