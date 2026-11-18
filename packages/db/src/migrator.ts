@@ -15,6 +15,13 @@ import type { PgPoolLike } from "./pg-pool.ts";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_MIGRATIONS_DIR = join(__dirname, "../migrations");
 
+/**
+ * 64-bit integer identifier for PostgreSQL transactional advisory lock (`pg_advisory_xact_lock`).
+ * Guarantees that concurrent migration runners (e.g. multiple container replicas or parallel test suites)
+ * serialize safely without catalog unique constraint races on `pg_type_typname_nsp_index`.
+ */
+export const MIGRATION_ADVISORY_LOCK_ID = 742918237192;
+
 export interface MigrationDescriptor {
   readonly version: string;
   readonly name: string;
@@ -74,39 +81,44 @@ export async function runMigrations(
     options?.migrationsDir ?? DEFAULT_MIGRATIONS_DIR
   );
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      checksum TEXT NOT NULL,
-      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `);
+  return await pool.withTransaction(async (tx) => {
+    // Acquire PostgreSQL transaction-level advisory lock to serialize concurrent migrations
+    await tx.query(
+      `SELECT pg_advisory_xact_lock(${MIGRATION_ADVISORY_LOCK_ID})`
+    );
 
-  const appliedRes = await pool.query<{ version: string; checksum: string }>(
-    `SELECT version, checksum FROM schema_migrations ORDER BY version ASC`
-  );
-  const appliedMap = new Map(appliedRes.rows.map((r) => [r.version, r.checksum]));
+    await tx.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
 
-  const appliedVersions: string[] = [];
-  const alreadyAppliedVersions: string[] = [];
+    const appliedRes = await tx.query<{ version: string; checksum: string }>(
+      `SELECT version, checksum FROM schema_migrations ORDER BY version ASC`
+    );
+    const appliedMap = new Map(appliedRes.rows.map((r) => [r.version, r.checksum]));
 
-  for (const mig of descriptors) {
-    const existingChecksum = appliedMap.get(mig.version);
-    if (existingChecksum !== undefined) {
-      if (
-        existingChecksum !== mig.checksum &&
-        !options?.ignoreChecksumMismatch
-      ) {
-        throw new Error(
-          `Migration checksum mismatch for ${mig.filename} (version ${mig.version}): expected ${existingChecksum}, found ${mig.checksum}`
-        );
+    const appliedVersions: string[] = [];
+    const alreadyAppliedVersions: string[] = [];
+
+    for (const mig of descriptors) {
+      const existingChecksum = appliedMap.get(mig.version);
+      if (existingChecksum !== undefined) {
+        if (
+          existingChecksum !== mig.checksum &&
+          !options?.ignoreChecksumMismatch
+        ) {
+          throw new Error(
+            `Migration checksum mismatch for ${mig.filename} (version ${mig.version}): expected ${existingChecksum}, found ${mig.checksum}`
+          );
+        }
+        alreadyAppliedVersions.push(mig.version);
+        continue;
       }
-      alreadyAppliedVersions.push(mig.version);
-      continue;
-    }
 
-    await pool.withTransaction(async (tx) => {
       if (mig.sql.length > 0) {
         await tx.query(mig.sql);
       }
@@ -116,13 +128,13 @@ export async function runMigrations(
          ON CONFLICT (version) DO NOTHING`,
         [mig.version, mig.name, mig.checksum]
       );
-    });
 
-    appliedVersions.push(mig.version);
-  }
+      appliedVersions.push(mig.version);
+    }
 
-  return {
-    appliedVersions,
-    alreadyAppliedVersions,
-  };
+    return {
+      appliedVersions,
+      alreadyAppliedVersions,
+    };
+  });
 }

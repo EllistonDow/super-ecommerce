@@ -230,6 +230,30 @@ describe("@super-ecommerce/db", () => {
     }
   });
 
+  it("serializes concurrent runMigrations calls via PostgreSQL transactional advisory lock without catalog races", async () => {
+    const pgPool = new OfflinePgPool();
+    try {
+      // Concurrently run 3 parallel runMigrations calls as would occur when multiple container replicas boot
+      const reports = await Promise.all([
+        runMigrations(pgPool),
+        runMigrations(pgPool),
+        runMigrations(pgPool),
+      ]);
+
+      assert.equal(reports.length, 3);
+      // All versions in schema_migrations are applied
+      const rows = await pgPool.query<{ version: string }>(
+        `SELECT version FROM schema_migrations ORDER BY version ASC`
+      );
+      assert.ok(rows.rows.length >= 3);
+      assert.ok(rows.rows.some((r) => r.version === "0001"));
+      assert.ok(rows.rows.some((r) => r.version === "0002"));
+      assert.ok(rows.rows.some((r) => r.version === "0003"));
+    } finally {
+      await pgPool.close();
+    }
+  });
+
   it("ranks hybrid catalog projections via Okapi BM25 + 64D semantic vector cosine and Reciprocal Rank Fusion (RRF k=60)", () => {
     const corpus: CatalogChannelProjectionRecord[] = [
       {

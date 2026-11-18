@@ -2440,6 +2440,35 @@ export class OfflinePgPool implements PgPoolLike {
           }
           return null;
         }
+        if (
+          expr.name === "pg_advisory_xact_lock" ||
+          expr.name === "pg_advisory_lock"
+        ) {
+          const rawArg = expr.args[0] ? await this.evalExpr(expr.args[0], env, ctx) : "default";
+          const lockKey = `advisory::${rawArg}`;
+          await this.acquireRowLock(lockKey, ctx, false);
+          return true;
+        }
+        if (
+          expr.name === "pg_try_advisory_xact_lock" ||
+          expr.name === "pg_try_advisory_lock"
+        ) {
+          const rawArg = expr.args[0] ? await this.evalExpr(expr.args[0], env, ctx) : "default";
+          const lockKey = `advisory::${rawArg}`;
+          return this.tryAcquireRowLockSync(lockKey, ctx);
+        }
+        if (expr.name === "pg_advisory_unlock") {
+          const rawArg = expr.args[0] ? await this.evalExpr(expr.args[0], env, ctx) : "default";
+          const lockKey = `advisory::${rawArg}`;
+          const existing = this.rowLocks.get(lockKey);
+          if (existing && existing.ownerTxId === ctx?.txId) {
+            this.rowLocks.delete(lockKey);
+            for (const w of existing.waiters) w();
+            ctx.heldLocks.delete(lockKey);
+            return true;
+          }
+          return false;
+        }
         const args = await Promise.all(
           expr.args.map((a) => this.evalExpr(a, env, ctx))
         );
@@ -2509,6 +2538,12 @@ export class OfflinePgPool implements PgPoolLike {
         return args;
       case "to_tsvector":
         return args.map((a) => String(a ?? "")).join(" ");
+      case "pg_advisory_xact_lock":
+      case "pg_advisory_lock":
+      case "pg_advisory_unlock":
+      case "pg_try_advisory_lock":
+      case "pg_try_advisory_xact_lock":
+        return true;
       default:
         return args[0] ?? null;
     }
