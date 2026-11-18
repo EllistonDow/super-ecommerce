@@ -1,15 +1,20 @@
-//! Two-Pass Pricing, Discount Precedence, Per-Line Attribution & Tax Engine.
+//! Two-Pass Pricing, Discount Precedence, Gross Margin Floor Guard, Per-Line Attribution & Tax Engine.
 //!
 //! Incorporates production battle-tested lessons from Saleor Core while fixing its
-//! two biggest limitations:
+//! biggest limitations:
 //! 1. Uses Hare-Niemeyer largest-remainder allocation instead of dumping rounding error
 //!    onto the last line.
 //! 2. Computes and exposes exact **per-discount-record per-line attribution**
 //!    (`LineDiscountAttribution`) so partial refunds, ERP sync, and price-waterfall
 //!    explanations never have to guess.
+//! 3. Enforces optional **Gross Margin Floor Guard (`unit_cost_amount` + `min_margin_bps`)**
+//!    so stacked tier/line/order discounts can never sell non-gift merchandise below the
+//!    merchant's cost + minimum margin floor.
 
 use crate::allocation::{allocate_pro_rata, WeightedItem};
-use crate::money::{apply_bps, div_round_half_up, resolve_tier_unit_price, Bps, MinorUnits, PriceTier, MAX_BPS};
+use crate::money::{
+    apply_bps, extract_vat_net, resolve_tier_unit_price, Bps, MinorUnits, PriceTier, MAX_BPS,
+};
 
 /// How discount values are specified.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +96,10 @@ pub struct CartLineInput {
     pub tax_rate_bps: Bps,
     pub is_gift: bool,
     pub candidate_line_discounts: Vec<CandidateLineDiscount>,
+    /// Optional unit cost in minor units for Gross Margin Floor Guard (`None` disables guard).
+    pub unit_cost_amount: Option<MinorUnits>,
+    /// Optional minimum gross margin percentage in bps (`0..=9999`), enforced when `unit_cost_amount` is `Some`.
+    pub min_margin_bps: Bps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +137,8 @@ pub struct CalculatedLineResult {
     pub subtotal_after_line_discount: MinorUnits,
     /// Pass 2 reduction allocated from order-level discount(s) via Hare-Niemeyer.
     pub allocated_order_discount_amount: MinorUnits,
+    /// Amount of excessive discount clawed back by the Gross Margin Floor Guard (`0` when unguarded).
+    pub margin_guard_clamped_amount: MinorUnits,
     /// Exact breakdown of every line-level and order-level discount applied to this line.
     pub discount_attributions: Vec<LineDiscountAttribution>,
     /// Final net amount (excluding tax).
@@ -161,6 +172,35 @@ pub struct CartCalculationResult {
     pub total_gross_amount: MinorUnits,
 }
 
+/// Computes the minimum allowed post-discount line amount (in stated catalog tax mode)
+/// required to satisfy `unit_cost_amount` and `min_margin_bps`.
+fn compute_line_margin_floor(line: &CartLineInput, mode: TaxInclusionMode) -> Option<MinorUnits> {
+    if line.is_gift || line.quantity == 0 {
+        return None;
+    }
+    let unit_cost = line.unit_cost_amount?.max(0);
+    let total_cost = unit_cost.saturating_mul(line.quantity as MinorUnits);
+    let capped_margin_bps = line.min_margin_bps.min(9_999);
+    // Accounting gross margin: (net - cost) / net >= margin_bps / 10_000
+    // => min_net = ceil/round(cost * 10_000 / (10_000 - margin_bps))
+    let min_net = if capped_margin_bps == 0 {
+        total_cost
+    } else {
+        let denom = (MAX_BPS - capped_margin_bps) as i128;
+        let numer = (total_cost as i128) * (MAX_BPS as i128);
+        // Ceiling division guarantees net margin never rounds 1 cent below floor
+        ((numer + denom - 1) / denom) as MinorUnits
+    };
+
+    match mode {
+        TaxInclusionMode::TaxExclusive => Some(min_net),
+        TaxInclusionMode::TaxInclusive => {
+            let min_gross = min_net + apply_bps(min_net, line.tax_rate_bps);
+            Some(min_gross)
+        }
+    }
+}
+
 /// Resolves taxes for a post-discount amount according to `TaxInclusionMode`.
 fn compute_net_tax_gross(
     post_discount_amount: MinorUnits,
@@ -179,12 +219,8 @@ fn compute_net_tax_gross(
             (net, tax, gross)
         }
         TaxInclusionMode::TaxInclusive => {
-            // Gross is the stated amount; Net = Gross * 10000 / (10000 + rate_bps)
             let gross = amount;
-            let net = div_round_half_up(
-                (gross as i128) * (MAX_BPS as i128),
-                (MAX_BPS as i128) + (tax_rate_bps as i128),
-            );
+            let net = extract_vat_net(gross, tax_rate_bps);
             let tax = gross - net;
             (net, tax, gross)
         }
@@ -215,11 +251,7 @@ fn select_winning_line_discount(
         return None;
     }
 
-    let highest_kind = line
-        .candidate_line_discounts
-        .iter()
-        .map(|d| d.kind)
-        .max()?;
+    let highest_kind = line.candidate_line_discounts.iter().map(|d| d.kind).max()?;
 
     line.candidate_line_discounts
         .iter()
@@ -229,12 +261,14 @@ fn select_winning_line_discount(
             (d.clone(), amount)
         })
         .max_by(|(d_a, amt_a), (d_b, amt_b)| {
-            amt_a.cmp(amt_b).then_with(|| d_b.discount_id.cmp(&d_a.discount_id))
+            amt_a
+                .cmp(amt_b)
+                .then_with(|| d_b.discount_id.cmp(&d_a.discount_id))
         })
 }
 
-/// Evaluates the entire cart deterministically across Pass 1 (Line level),
-/// Pass 2 (Order level + Hare-Niemeyer Pro-Rata Allocation), and Pass 3 (Tax).
+/// Evaluates the entire cart deterministically across Pass 1 (Line level + Margin Floor),
+/// Pass 2 (Order level + Hare-Niemeyer Pro-Rata Allocation + Margin Floor), and Pass 3 (Tax).
 pub fn calculate_cart(input: &CartCalculationInput) -> CartCalculationResult {
     // -------------------------------------------------------------------------
     // PASS 1: B2B Tier Resolution & Line-Level Discounts
@@ -242,41 +276,57 @@ pub fn calculate_cart(input: &CartCalculationInput) -> CartCalculationResult {
     struct Pass1Line {
         effective_base_unit_price: MinorUnits,
         undiscounted_subtotal: MinorUnits,
+        margin_floor_amount: Option<MinorUnits>,
         line_discount_amount: MinorUnits,
         subtotal_after_line_discount: MinorUnits,
+        clamped_amount: MinorUnits,
         attributions: Vec<LineDiscountAttribution>,
     }
 
     let mut pass1_lines: Vec<Pass1Line> = Vec::with_capacity(input.lines.len());
 
     for line in &input.lines {
-        let effective_unit = if line.is_gift {
+        let margin_floor_amount = compute_line_margin_floor(line, input.tax_mode);
+        let raw_effective_unit = if line.is_gift {
             line.base_unit_price.max(0)
         } else {
             resolve_tier_unit_price(line.base_unit_price, line.quantity, &line.tier_prices)
         };
-        let undiscounted_subtotal = effective_unit.saturating_mul(line.quantity as MinorUnits);
+        let undiscounted_subtotal = raw_effective_unit.saturating_mul(line.quantity as MinorUnits);
+
+        let max_line_discount = match margin_floor_amount {
+            Some(floor) => (undiscounted_subtotal - floor).max(0),
+            None => undiscounted_subtotal,
+        };
 
         let mut attributions = Vec::new();
+        let mut clamped_amount: MinorUnits = 0;
+
         let line_discount_amount = match select_winning_line_discount(line, undiscounted_subtotal) {
-            Some((winner, amt)) if amt > 0 => {
-                attributions.push(LineDiscountAttribution {
-                    discount_id: winner.discount_id,
-                    name: winner.name,
-                    is_order_level: false,
-                    amount: amt,
-                });
-                amt
+            Some((winner, raw_amt)) if raw_amt > 0 => {
+                let effective_amt = raw_amt.min(max_line_discount);
+                clamped_amount += raw_amt - effective_amt;
+                if effective_amt > 0 {
+                    attributions.push(LineDiscountAttribution {
+                        discount_id: winner.discount_id,
+                        name: winner.name,
+                        is_order_level: false,
+                        amount: effective_amt,
+                    });
+                }
+                effective_amt
             }
             _ => 0,
         };
 
         let subtotal_after_line_discount = undiscounted_subtotal - line_discount_amount;
         pass1_lines.push(Pass1Line {
-            effective_base_unit_price: effective_unit,
+            effective_base_unit_price: raw_effective_unit,
             undiscounted_subtotal,
+            margin_floor_amount,
             line_discount_amount,
             subtotal_after_line_discount,
+            clamped_amount,
             attributions,
         });
     }
@@ -284,8 +334,6 @@ pub fn calculate_cart(input: &CartCalculationInput) -> CartCalculationResult {
     // -------------------------------------------------------------------------
     // PASS 2: Order-Level Precedence & Pro-Rata Line Allocation
     // -------------------------------------------------------------------------
-    // Precedence rule: ManualOrder > OrderVoucher > OrderPromotion (exclusive).
-    // ShippingVoucher applies to shipping independently.
     let subtotal_eligible_for_order_discount: MinorUnits = pass1_lines
         .iter()
         .map(|l| l.subtotal_after_line_discount)
@@ -308,7 +356,9 @@ pub fn calculate_cart(input: &CartCalculationInput) -> CartCalculationResult {
                 (d.clone(), amt)
             })
             .max_by(|(d_a, amt_a), (d_b, amt_b)| {
-                amt_a.cmp(amt_b).then_with(|| d_b.discount_id.cmp(&d_a.discount_id))
+                amt_a
+                    .cmp(amt_b)
+                    .then_with(|| d_b.discount_id.cmp(&d_a.discount_id))
             })
     });
 
@@ -328,24 +378,36 @@ pub fn calculate_cart(input: &CartCalculationInput) -> CartCalculationResult {
                 .collect();
 
             let shares = allocate_pro_rata(total_order_discount, &weighted_items);
+            let mut actual_order_discount_sum: MinorUnits = 0;
+
             for (idx, share) in shares.into_iter().enumerate() {
-                allocated_per_line[idx] = share.allocated;
-                if share.allocated > 0 {
+                let max_additional = match pass1_lines[idx].margin_floor_amount {
+                    Some(floor) => (pass1_lines[idx].subtotal_after_line_discount - floor).max(0),
+                    None => pass1_lines[idx].subtotal_after_line_discount,
+                };
+                let effective_slice = share.allocated.min(max_additional);
+                pass1_lines[idx].clamped_amount += share.allocated - effective_slice;
+                allocated_per_line[idx] = effective_slice;
+                actual_order_discount_sum += effective_slice;
+
+                if effective_slice > 0 {
                     pass1_lines[idx].attributions.push(LineDiscountAttribution {
                         discount_id: winner.discount_id.clone(),
                         name: winner.name.clone(),
                         is_order_level: true,
-                        amount: share.allocated,
+                        amount: effective_slice,
                     });
                 }
             }
 
-            applied_order_discounts.push(AppliedOrderDiscountSummary {
-                discount_id: winner.discount_id,
-                name: winner.name,
-                kind: winner.kind,
-                total_amount: total_order_discount,
-            });
+            if actual_order_discount_sum > 0 {
+                applied_order_discounts.push(AppliedOrderDiscountSummary {
+                    discount_id: winner.discount_id,
+                    name: winner.name,
+                    kind: winner.kind,
+                    total_amount: actual_order_discount_sum,
+                });
+            }
         }
     }
 
@@ -360,7 +422,9 @@ pub fn calculate_cart(input: &CartCalculationInput) -> CartCalculationResult {
             (d.clone(), amt)
         })
         .max_by(|(d_a, amt_a), (d_b, amt_b)| {
-            amt_a.cmp(amt_b).then_with(|| d_b.discount_id.cmp(&d_a.discount_id))
+            amt_a
+                .cmp(amt_b)
+                .then_with(|| d_b.discount_id.cmp(&d_a.discount_id))
         });
 
     let shipping_discount_amount = match winning_shipping_discount {
@@ -408,6 +472,7 @@ pub fn calculate_cart(input: &CartCalculationInput) -> CartCalculationResult {
             line_level_discount_amount: p1.line_discount_amount,
             subtotal_after_line_discount: p1.subtotal_after_line_discount,
             allocated_order_discount_amount: order_disc_slice,
+            margin_guard_clamped_amount: p1.clamped_amount,
             discount_attributions: p1.attributions,
             total_net_amount: net,
             total_tax_amount: tax,
@@ -452,30 +517,32 @@ mod tests {
                 line_id: "L1".into(),
                 variant_id: "V1".into(),
                 quantity: 1,
-                base_unit_price: 10_000, // $100.00
+                base_unit_price: 10_000,
                 tier_prices: vec![],
-                tax_rate_bps: 1000, // 10%
+                tax_rate_bps: 1000,
                 is_gift: false,
                 candidate_line_discounts: vec![],
+                unit_cost_amount: None,
+                min_margin_bps: 0,
             }],
             candidate_order_discounts: vec![
                 CandidateOrderDiscount {
                     discount_id: "promo-50".into(),
                     name: "50% Off Order Promo".into(),
                     kind: OrderDiscountKind::OrderPromotion,
-                    value: DiscountValue::Percentage(5000), // $50
+                    value: DiscountValue::Percentage(5000),
                 },
                 CandidateOrderDiscount {
                     discount_id: "voucher-30".into(),
                     name: "$30 Voucher".into(),
                     kind: OrderDiscountKind::OrderVoucher,
-                    value: DiscountValue::Fixed(3000), // $30
+                    value: DiscountValue::Fixed(3000),
                 },
                 CandidateOrderDiscount {
                     discount_id: "manual-15".into(),
                     name: "$15 Manual Agent Discount".into(),
                     kind: OrderDiscountKind::ManualOrder,
-                    value: DiscountValue::Fixed(1500), // $15 wins because ManualOrder > Voucher > Promo
+                    value: DiscountValue::Fixed(1500),
                 },
             ],
         };
@@ -484,7 +551,6 @@ mod tests {
         assert_eq!(result.applied_order_discounts.len(), 1);
         assert_eq!(result.applied_order_discounts[0].discount_id, "manual-15");
         assert_eq!(result.lines[0].allocated_order_discount_amount, 1500);
-        // Net = $100 - $15 = $85.00 (8500), Tax 10% = $8.50 (850), Gross = $93.50 (9350)
         assert_eq!(result.lines[0].total_net_amount, 8500);
         assert_eq!(result.lines[0].total_tax_amount, 850);
         assert_eq!(result.lines[0].total_gross_amount, 9350);
@@ -504,9 +570,11 @@ mod tests {
                     quantity: 1,
                     base_unit_price: 5000,
                     tier_prices: vec![],
-                    tax_rate_bps: 2000, // 20% VAT included
+                    tax_rate_bps: 2000,
                     is_gift: false,
                     candidate_line_discounts: vec![],
+                    unit_cost_amount: None,
+                    min_margin_bps: 0,
                 },
                 CartLineInput {
                     line_id: "free-gift".into(),
@@ -517,6 +585,8 @@ mod tests {
                     tax_rate_bps: 2000,
                     is_gift: true,
                     candidate_line_discounts: vec![],
+                    unit_cost_amount: None,
+                    min_margin_bps: 0,
                 },
             ],
             candidate_order_discounts: vec![CandidateOrderDiscount {
@@ -531,16 +601,50 @@ mod tests {
         let paid = &res.lines[0];
         let gift = &res.lines[1];
 
-        // Paid item absorbs 100% of the 10 EUR order voucher
         assert_eq!(paid.allocated_order_discount_amount, 1000);
         assert_eq!(paid.total_gross_amount, 4000);
-        // 4000 gross at 20% VAT -> net = 4000 * 10000 / 12000 = 3333, tax = 667
         assert_eq!(paid.total_net_amount, 3333);
         assert_eq!(paid.total_tax_amount, 667);
 
-        // Gift line has 100% line-level gift discount and 0 order-level allocation
         assert_eq!(gift.line_level_discount_amount, 2000);
         assert_eq!(gift.allocated_order_discount_amount, 0);
         assert_eq!(gift.total_gross_amount, 0);
+    }
+
+    #[test]
+    fn test_gross_margin_floor_guard_clamps_excessive_discounts() {
+        // Retail $150.00 (15_000), Unit Cost $80.00 (8_000), Min Gross Margin 20% (2000 bps)
+        // Minimum selling net = $80 / (1 - 0.20) = $100.00 (10_000).
+        // A 50% voucher ($75 off -> $75 net) must be clamped to $50.00 off ($100.00 net), saving $25.00!
+        let input = CartCalculationInput {
+            currency_code: "USD".into(),
+            tax_mode: TaxInclusionMode::TaxExclusive,
+            shipping_base_amount: 0,
+            shipping_tax_rate_bps: 0,
+            lines: vec![CartLineInput {
+                line_id: "L-GUARD".into(),
+                variant_id: "KR-DAC".into(),
+                quantity: 1,
+                base_unit_price: 15_000,
+                tier_prices: vec![],
+                tax_rate_bps: 0,
+                is_gift: false,
+                candidate_line_discounts: vec![],
+                unit_cost_amount: Some(8_000),
+                min_margin_bps: 2_000,
+            }],
+            candidate_order_discounts: vec![CandidateOrderDiscount {
+                discount_id: "vouch-50pct".into(),
+                name: "50% Off Sitewide".into(),
+                kind: OrderDiscountKind::OrderVoucher,
+                value: DiscountValue::Percentage(5000),
+            }],
+        };
+
+        let res = calculate_cart(&input);
+        assert_eq!(res.lines[0].allocated_order_discount_amount, 5_000);
+        assert_eq!(res.lines[0].margin_guard_clamped_amount, 2_500);
+        assert_eq!(res.lines[0].total_net_amount, 10_000);
+        assert_eq!(res.applied_order_discounts[0].total_amount, 5_000);
     }
 }

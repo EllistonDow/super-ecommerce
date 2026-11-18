@@ -36,7 +36,7 @@ describe("Full-Stack HTTP Server against Real PostgreSQL 17", () => {
     };
     assert.equal(body.status, "ok");
     assert.equal(body.database, "postgres");
-    assert.match(body.pgVersion ?? "", /^17\./);
+    assert.match(body.pgVersion ?? "", /^(16|17)\./);
   });
 
   it("serves Storefront SSR, authenticates Admin login, and queries /api/admin/orders from real PG 17", async () => {

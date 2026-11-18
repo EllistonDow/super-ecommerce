@@ -8,7 +8,7 @@
  * - Least-privilege RBAC matrix across `SUPER_ADMIN`, `MERCHANT_OPS`, and `FINANCE_AUDITOR`
  */
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
 export type AdminRole = "SUPER_ADMIN" | "MERCHANT_OPS" | "FINANCE_AUDITOR";
 
@@ -79,55 +79,160 @@ export const ROLE_PERMISSION_MATRIX: Record<AdminRole, readonly AdminPermission[
   ],
 };
 
-const PASSWORD_PEPPER = "kronos_super_ecommerce_pwd_pepper_2026";
+const LEGACY_PASSWORD_PEPPER = "kronos_super_ecommerce_pwd_pepper_2026";
+const SCRYPT_N = 4096;
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const SCRYPT_KEYLEN = 64;
 
-function hashPasswordHex(email: string, password: string): string {
-  return createHmac("sha256", PASSWORD_PEPPER)
+const memoizedSeedScrypt = new Map<string, string>();
+
+/**
+ * Generates a salted memory-hard `scrypt` password digest:
+ * `scrypt$4096$8$1$<saltHex>$<derivedKeyHex>`
+ */
+export function hashAdminPasswordScrypt(passwordPlain: string, customSalt?: Buffer): string {
+  const salt = customSalt ?? randomBytes(16);
+  const cacheKey = customSalt ? `${salt.toString("hex")}:${passwordPlain}` : null;
+  if (cacheKey && memoizedSeedScrypt.has(cacheKey)) {
+    return memoizedSeedScrypt.get(cacheKey)!;
+  }
+  const derived = scryptSync(passwordPlain, salt, SCRYPT_KEYLEN, {
+    N: SCRYPT_N,
+    r: SCRYPT_R,
+    p: SCRYPT_P,
+  });
+  const out = `scrypt$${SCRYPT_N}$${SCRYPT_R}$${SCRYPT_P}$${salt.toString("hex")}$${derived.toString("hex")}`;
+  if (cacheKey) {
+    memoizedSeedScrypt.set(cacheKey, out);
+  }
+  return out;
+}
+
+function hashLegacyPasswordHex(email: string, password: string): string {
+  return createHmac("sha256", LEGACY_PASSWORD_PEPPER)
     .update(`${email.toLowerCase().trim()}:${password}`)
     .digest("hex");
 }
 
-function constantTimeHexEqual(aHex: string, bHex: string): boolean {
+export function constantTimeHexEqual(aHex: string, bHex: string): boolean {
   if (aHex.length !== bHex.length) return false;
   const bufA = Buffer.from(aHex, "utf8");
   const bufB = Buffer.from(bHex, "utf8");
   return timingSafeEqual(bufA, bufB);
 }
 
+/**
+ * Verifies a plaintext password against either a modern `scrypt$...` digest or a legacy
+ * HMAC digest in constant time, signaling `needsRehash = true` for legacy digests.
+ */
+export function verifyAdminPasswordConstantTime(
+  email: string,
+  passwordPlain: string,
+  storedHash: string
+): { valid: boolean; needsRehash: boolean } {
+  if (storedHash.startsWith("scrypt$")) {
+    const parts = storedHash.split("$");
+    if (parts.length !== 6) {
+      return { valid: false, needsRehash: false };
+    }
+    const n = Number(parts[1]);
+    const r = Number(parts[2]);
+    const p = Number(parts[3]);
+    const saltHex = parts[4]!;
+    const expectedHex = parts[5]!;
+    if (!Number.isFinite(n) || !Number.isFinite(r) || !Number.isFinite(p) || !saltHex) {
+      return { valid: false, needsRehash: false };
+    }
+    const salt = Buffer.from(saltHex, "hex");
+    const derivedHex = scryptSync(passwordPlain, salt, expectedHex.length / 2, {
+      N: n,
+      r,
+      p,
+    }).toString("hex");
+    return {
+      valid: constantTimeHexEqual(derivedHex, expectedHex),
+      needsRehash: false,
+    };
+  }
+
+  const candidateLegacy = hashLegacyPasswordHex(email, passwordPlain);
+  const validLegacy = constantTimeHexEqual(candidateLegacy, storedHash);
+  return { valid: validLegacy, needsRehash: validLegacy };
+}
+
+let cachedDummyFallbackHash: string | null = null;
+function getDummyFallbackScryptHash(): string {
+  if (!cachedDummyFallbackHash) {
+    cachedDummyFallbackHash = hashAdminPasswordScrypt(
+      "dummy_constant_time_fallback_password",
+      Buffer.from("0123456789abcdef0123456789abcdef", "hex")
+    );
+  }
+  return cachedDummyFallbackHash;
+}
+
+function makeSeedAccount(params: {
+  userId: string;
+  email: string;
+  displayName: string;
+  role: AdminRole;
+  demoPasswordPlain: string;
+  saltHex: string;
+  scopeSummary: string;
+}): SeededAdminAccount {
+  let cachedDigest: string | null = null;
+  return {
+    userId: params.userId,
+    email: params.email,
+    displayName: params.displayName,
+    role: params.role,
+    permissions: ROLE_PERMISSION_MATRIX[params.role],
+    demoPasswordPlain: params.demoPasswordPlain,
+    get passwordDigestHex(): string {
+      if (!cachedDigest) {
+        cachedDigest = hashAdminPasswordScrypt(
+          params.demoPasswordPlain,
+          Buffer.from(params.saltHex, "hex")
+        );
+      }
+      return cachedDigest;
+    },
+    scopeSummary: params.scopeSummary,
+  };
+}
+
 export const SEEDED_ADMIN_ACCOUNTS: readonly SeededAdminAccount[] = [
-  {
+  makeSeedAccount({
     userId: "adm_01_super",
     email: "admin@kronos.io",
     displayName: "Ada Lovelace (Platform Architect)",
     role: "SUPER_ADMIN",
-    permissions: ROLE_PERMISSION_MATRIX.SUPER_ADMIN,
     demoPasswordPlain: "Kronos!Admin2026",
-    passwordDigestHex: hashPasswordHex("admin@kronos.io", "Kronos!Admin2026"),
+    saltHex: "a101a101a101a101a101a101a101a101",
     scopeSummary:
       "Full 7/7 permissions: Configurator DAG deploy, WASM/Outbox/Saga chaos injection, MSI routing, PG stress",
-  },
-  {
+  }),
+  makeSeedAccount({
     userId: "adm_02_ops",
     email: "ops@kronos.io",
     displayName: "Marcus Vance (Fulfillment Lead)",
     role: "MERCHANT_OPS",
-    permissions: ROLE_PERMISSION_MATRIX.MERCHANT_OPS,
     demoPasswordPlain: "Kronos!Ops2026",
-    passwordDigestHex: hashPasswordHex("ops@kronos.io", "Kronos!Ops2026"),
+    saltHex: "b202b202b202b202b202b202b202b202",
     scopeSummary:
       "4/7 permissions: MSI stock routing, 5-step Saga orders & MCP Doctor (Blocked from Configurator DAG & Chaos Faults)",
-  },
-  {
+  }),
+  makeSeedAccount({
     userId: "adm_03_audit",
     email: "audit@kronos.io",
     displayName: "Elena Rostova (Financial Auditor)",
     role: "FINANCE_AUDITOR",
-    permissions: ROLE_PERMISSION_MATRIX.FINANCE_AUDITOR,
     demoPasswordPlain: "Kronos!Audit2026",
-    passwordDigestHex: hashPasswordHex("audit@kronos.io", "Kronos!Audit2026"),
+    saltHex: "c303c303c303c303c303c303c303c303",
     scopeSummary:
       "3/7 permissions: Price waterfall & Stripe Webhook audit (Read-only on MSI routing, Configurator & Chaos Faults)",
-  },
+  }),
 ];
 
 export const ADMIN_SESSION_COOKIE_NAME = "super_admin_session";
@@ -235,12 +340,13 @@ export class AdminAuthRbacService {
     const account = SEEDED_ADMIN_ACCOUNTS.find(
       (a) => a.email.toLowerCase() === normalizedEmail
     );
-    const candidateHex = hashPasswordHex(normalizedEmail, password);
-    const targetHex =
-      account?.passwordDigestHex ??
-      hashPasswordHex("invalid@kronos.io", "dummy_constant_time_fallback");
-
-    const matched = Boolean(account) && constantTimeHexEqual(candidateHex, targetHex);
+    const targetHash = account?.passwordDigestHex ?? getDummyFallbackScryptHash();
+    const verification = verifyAdminPasswordConstantTime(
+      normalizedEmail,
+      password,
+      targetHash
+    );
+    const matched = Boolean(account) && verification.valid;
 
     if (!matched || !account) {
       const audit = this.recordAudit({

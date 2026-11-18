@@ -1,113 +1,180 @@
 /**
  * Edge / Browser WebAssembly (`WASM`) Pricing Kernel (`packages/kernel/src/wasm-kernel.ts`).
  *
- * Compiles and instantiates a portable WebAssembly binary that executes 64-bit integer
- * Round-Half-Up basis-point pricing (`apply_bps_wasm`) and VAT extraction (`extract_vat_net_wasm`)
- * identically across Cloudflare Workers, Deno, Bun, Node 22+, and browsers.
+ * Loads the genuine Rust-compiled `commerce_kernel.wasm` binary built from `crates/kernel-wasm`
+ * (`wasm32-unknown-unknown`), sharing 100% single-source logic with `commerce_kernel.node` across:
+ * - `applyBps` & `extractVatNet` & `currencyExponent`
+ * - Full Two-Pass Hare-Niemeyer + Margin Floor Guard `calculateCart`
+ * - `allocateProRata`, `calculateReturnRefund`, and `evaluateB2bPurchasePolicy`
+ *
+ * Retains a minimal inline WASM binary fallback if `commerce_kernel.wasm` is not present on disk.
  */
 
-import type { Bps, MinorUnits } from "./index.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type {
+  AllocatedShare,
+  B2bPurchasePolicyInput,
+  B2bPurchasePolicyResult,
+  Bps,
+  CartCalculationInput,
+  CartCalculationResult,
+  MinorUnits,
+  RefundCalculationInput,
+  RefundCalculationResult,
+  WeightedItem,
+} from "./index.ts";
+import {
+  decodeB2bPolicyPayload,
+  decodeCartPayload,
+  decodeProRataPayload,
+  decodeReturnRefundPayload,
+  encodeB2bPolicyPayload,
+  encodeCartPayload,
+  encodeProRataPayload,
+  encodeReturnRefundPayload,
+} from "./rust-bridge.ts";
 
-/**
- * Assembles the portable WebAssembly module exporting:
- * - `apply_bps_wasm(amount: i64, bps: i64) -> i64`: `((amount * bps) + 5000) / 10000`
- * - `extract_vat_net_wasm(gross: i64, rate_bps: i64) -> i64`: `((gross * 10000) + ((10000 + rate) / 2)) / (10000 + rate)`
- */
-export function buildCommerceKernelWasmBytes(): Uint8Array {
+function buildMinimalFallbackWasmBytes(): Uint8Array {
   const nameApplyBps = new TextEncoder().encode("apply_bps_wasm");
   const nameExtractVat = new TextEncoder().encode("extract_vat_net_wasm");
-
-  // Function 0 body: apply_bps_wasm(param 0: i64, param 1: i64) -> i64
-  // ((local.get 0 * local.get 1) + 5000) / 10000
-  // 5000 in signed LEB128 = [0x88, 0x27]
-  // 10000 in signed LEB128 = [0x90, 0xce, 0x00] (3 bytes because bit 6 of 0x4e is 1)
   const bodyApplyBps = [
-    0x00, // 0 locals
-    0x20, 0x00, // local.get 0 (amount)
-    0x20, 0x01, // local.get 1 (bps)
-    0x7e, // i64.mul
-    0x42, 0x88, 0x27, // i64.const 5000
-    0x7c, // i64.add
-    0x42, 0x90, 0xce, 0x00, // i64.const 10000
-    0x7f, // i64.div_s
-    0x0b, // end
+    0x00, 0x20, 0x00, 0x20, 0x01, 0x7e, 0x42, 0x88, 0x27, 0x7c, 0x42, 0x90, 0xce, 0x00, 0x7f, 0x0b,
   ];
-
-  // Function 1 body: extract_vat_net_wasm(param 0: gross i64, param 1: rate_bps i64) -> i64
-  // ((gross * 10000) + ((10000 + rate_bps) / 2)) / (10000 + rate_bps)
   const bodyExtractVat = [
-    0x00, // 0 locals
-    0x20, 0x00, // local.get 0 (gross)
-    0x42, 0x90, 0xce, 0x00, // i64.const 10000
-    0x7e, // i64.mul
-    0x42, 0x90, 0xce, 0x00, // i64.const 10000
-    0x20, 0x01, // local.get 1 (rate_bps)
-    0x7c, // i64.add
-    0x42, 0x02, // i64.const 2
-    0x7f, // i64.div_s
-    0x7c, // i64.add
-    0x42, 0x90, 0xce, 0x00, // i64.const 10000
-    0x20, 0x01, // local.get 1 (rate_bps)
-    0x7c, // i64.add
-    0x7f, // i64.div_s
-    0x0b, // end
+    0x00, 0x20, 0x00, 0x42, 0x90, 0xce, 0x00, 0x7e, 0x42, 0x90, 0xce, 0x00, 0x20, 0x01, 0x7c,
+    0x42, 0x02, 0x7f, 0x7c, 0x42, 0x90, 0xce, 0x00, 0x20, 0x01, 0x7c, 0x7f, 0x0b,
   ];
-
   const exportPayload = [
-    0x02, // 2 exports
+    0x02,
     nameApplyBps.length,
     ...nameApplyBps,
     0x00,
-    0x00, // func 0
+    0x00,
     nameExtractVat.length,
     ...nameExtractVat,
     0x00,
-    0x01, // func 1
+    0x01,
   ];
-
   const codePayload = [
-    0x02, // 2 function bodies
+    0x02,
     bodyApplyBps.length,
     ...bodyApplyBps,
     bodyExtractVat.length,
     ...bodyExtractVat,
   ];
-
   return new Uint8Array([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-    // Type section: 1 type (i64, i64) -> i64
     0x01, 0x07, 0x01, 0x60, 0x02, 0x7e, 0x7e, 0x01, 0x7e,
-    // Function section: 2 funcs of type 0
     0x03, 0x03, 0x02, 0x00, 0x00,
-    // Export section
-    0x07,
-    exportPayload.length,
-    ...exportPayload,
-    // Code section
-    0x0a,
-    codePayload.length,
-    ...codePayload,
+    0x07, exportPayload.length, ...exportPayload,
+    0x0a, codePayload.length, ...codePayload,
   ]);
 }
 
-export interface WasmPricingKernelInstance {
-  applyBps(amount: MinorUnits, bps: Bps): MinorUnits;
-  extractVatNet(grossAmount: MinorUnits, taxRateBps: Bps): MinorUnits;
+let cachedCompiledWasmBytes: Uint8Array | null = null;
+
+/**
+ * Loads the compiled `crates/kernel-wasm` WebAssembly binary (`commerce_kernel.wasm`) once and
+ * caches the bytes in memory, falling back to the minimal inline WASM binary in stripped environments.
+ */
+export function buildCommerceKernelWasmBytes(): Uint8Array {
+  if (cachedCompiledWasmBytes) {
+    return cachedCompiledWasmBytes;
+  }
+  try {
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const wasmPath = join(__dirname, "../native/commerce_kernel.wasm");
+    if (existsSync(wasmPath)) {
+      cachedCompiledWasmBytes = new Uint8Array(readFileSync(wasmPath));
+      return cachedCompiledWasmBytes;
+    }
+  } catch {
+    // Ignore FS errors in pure Edge/Browser runtimes
+  }
+  cachedCompiledWasmBytes = buildMinimalFallbackWasmBytes();
+  return cachedCompiledWasmBytes;
 }
 
-export async function instantiateWasmPricingKernel(): Promise<WasmPricingKernelInstance> {
-  const bytes = buildCommerceKernelWasmBytes();
+export interface WasmPricingKernelInstance {
+  readonly isCompiledFromRustCrate: boolean;
+  applyBps(amount: MinorUnits, bps: Bps): MinorUnits;
+  extractVatNet(grossAmount: MinorUnits, taxRateBps: Bps): MinorUnits;
+  currencyExponent(currencyCode: string): number;
+  calculateCart?(input: CartCalculationInput): CartCalculationResult;
+  allocateProRata?(totalToAllocate: MinorUnits, items: readonly WeightedItem[]): AllocatedShare[];
+  calculateReturnRefund?(input: RefundCalculationInput): RefundCalculationResult;
+  evaluateB2bPurchasePolicy?(input: B2bPurchasePolicyInput): B2bPurchasePolicyResult;
+}
+
+export async function instantiateWasmPricingKernel(
+  customBytes?: Uint8Array
+): Promise<WasmPricingKernelInstance> {
+  const bytes = customBytes ?? buildCommerceKernelWasmBytes();
   const { instance } = await WebAssembly.instantiate(bytes, {});
-  const applyBpsFn = instance.exports["apply_bps_wasm"] as (
-    amount: bigint,
-    bps: bigint
-  ) => bigint;
-  const extractVatFn = instance.exports["extract_vat_net_wasm"] as (
-    gross: bigint,
-    rateBps: bigint
-  ) => bigint;
+  const exports = instance.exports;
+
+  const applyBpsFn = exports["apply_bps_wasm"] as (amount: bigint, bps: bigint) => bigint;
+  const extractVatFn = exports["extract_vat_net_wasm"] as (gross: bigint, rateBps: bigint) => bigint;
+  const currencyExpFn = exports["currency_exponent_wasm"] as
+    | ((c0: number, c1: number, c2: number) => number)
+    | undefined;
+  const memory = exports["memory"] as WebAssembly.Memory | undefined;
+  const allocFn = exports["wasm_alloc"] as ((size: number) => number) | undefined;
+  const deallocFn = exports["wasm_dealloc"] as ((ptr: number, cap: number) => void) | undefined;
+  const calcCartFn = exports["wasm_calculate_cart"] as
+    | ((ptr: number, len: number) => bigint)
+    | undefined;
+  const allocProRataFn = exports["wasm_allocate_pro_rata"] as
+    | ((total: bigint, ptr: number, len: number) => bigint)
+    | undefined;
+  const calcRefundFn = exports["wasm_calculate_return_refund"] as
+    | ((ptr: number, len: number) => bigint)
+    | undefined;
+  const evalB2bFn = exports["wasm_evaluate_b2b_policy"] as
+    | ((ptr: number, len: number) => bigint)
+    | undefined;
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+
+  function invokeLinearMemoryCodec(
+    inputPayload: string,
+    callFn: (ptr: number, len: number) => bigint
+  ): string {
+    if (!memory || !allocFn || !deallocFn) {
+      throw new Error("Full Rust WASM linear memory exports unavailable");
+    }
+    const encoded = encoder.encode(inputPayload);
+    const inPtr = encoded.length > 0 ? allocFn(encoded.length) : 0;
+    try {
+      if (encoded.length > 0) {
+        new Uint8Array(memory.buffer, inPtr, encoded.length).set(encoded);
+      }
+      const packed = callFn(inPtr, encoded.length);
+      const outPtr = Number((packed >> 32n) & 0xffff_ffffn);
+      const outLen = Number(packed & 0xffff_ffffn);
+      if (outLen === 0 || outPtr === 0) {
+        return "";
+      }
+      try {
+        const outSlice = new Uint8Array(memory.buffer, outPtr, outLen);
+        return decoder.decode(outSlice);
+      } finally {
+        deallocFn(outPtr, outLen);
+      }
+    } finally {
+      if (encoded.length > 0 && inPtr !== 0) {
+        deallocFn(inPtr, encoded.length);
+      }
+    }
+  }
+
+  const isCompiledFromRustCrate = Boolean(memory && allocFn && deallocFn && calcCartFn);
 
   return {
+    isCompiledFromRustCrate,
     applyBps(amount, bps) {
       if (amount <= 0n || bps <= 0) return 0n;
       const clamped = BigInt(Math.min(Math.floor(bps), 10_000));
@@ -117,5 +184,47 @@ export async function instantiateWasmPricingKernel(): Promise<WasmPricingKernelI
       if (grossAmount <= 0n || taxRateBps <= 0) return grossAmount > 0n ? grossAmount : 0n;
       return extractVatFn(grossAmount, BigInt(Math.floor(taxRateBps)));
     },
+    currencyExponent(currencyCode) {
+      const trimmed = currencyCode.trim().toUpperCase();
+      if (trimmed.length !== 3) return 2;
+      if (currencyExpFn) {
+        return currencyExpFn(
+          trimmed.charCodeAt(0),
+          trimmed.charCodeAt(1),
+          trimmed.charCodeAt(2)
+        );
+      }
+      return 2;
+    },
+    calculateCart: isCompiledFromRustCrate
+      ? (input) => {
+          const raw = invokeLinearMemoryCodec(encodeCartPayload(input), calcCartFn!);
+          return decodeCartPayload(raw, input.currencyCode);
+        }
+      : undefined,
+    allocateProRata:
+      isCompiledFromRustCrate && allocProRataFn
+        ? (total, items) => {
+            if (items.length === 0) return [];
+            const raw = invokeLinearMemoryCodec(encodeProRataPayload(items), (p, l) =>
+              allocProRataFn(total, p, l)
+            );
+            return decodeProRataPayload(raw);
+          }
+        : undefined,
+    calculateReturnRefund:
+      isCompiledFromRustCrate && calcRefundFn
+        ? (input) => {
+            const raw = invokeLinearMemoryCodec(encodeReturnRefundPayload(input), calcRefundFn);
+            return decodeReturnRefundPayload(raw, input.currencyCode);
+          }
+        : undefined,
+    evaluateB2bPurchasePolicy:
+      isCompiledFromRustCrate && evalB2bFn
+        ? (input) => {
+            const raw = invokeLinearMemoryCodec(encodeB2bPolicyPayload(input), evalB2bFn);
+            return decodeB2bPolicyPayload(raw, input.cart.currencyCode);
+          }
+        : undefined,
   };
 }

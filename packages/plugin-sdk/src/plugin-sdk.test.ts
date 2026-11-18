@@ -108,4 +108,72 @@ describe("@super-ecommerce/plugin-sdk — WASM Sandbox Host", () => {
       assert.equal(c.usedFallback, true);
     }
   });
+
+  it("preemptively kills a true infinite WASM loop (br 0) in a worker isolate without blocking the main event loop", async () => {
+    const host = new WasmPluginSandboxHost();
+    try {
+      await host.registerWasmPlugin({
+        pluginId: "rogue-infinite-loop",
+        name: "Rogue Infinite Loop WASM",
+        maxExecutionMs: 25,
+        wasmBytes: buildShippingSurchargeWasm("INFINITE_LOOP"),
+      });
+      await host.registerWasmPlugin({
+        pluginId: "healthy-after-kill",
+        name: "Healthy Weight Surcharge WASM",
+        maxExecutionMs: 50,
+        wasmBytes: buildShippingSurchargeWasm("DYNAMIC_WEIGHT_SURCHARGE"),
+      });
+
+      let mainThreadHeartbeats = 0;
+      const heartbeatTimer = setInterval(() => {
+        mainThreadHeartbeats += 1;
+      }, 5);
+
+      const ctx = {
+        channelSlug: "us-retail",
+        countryCode: "US",
+        currencyCode: "USD",
+        cartSubtotalAmount: 20_000n,
+        totalWeightGrams: 3_000,
+        isB2bCustomer: false,
+      };
+
+      const killedRes = await host.executePreemptiveShippingSurchargeWasm({
+        pluginId: "rogue-infinite-loop",
+        fallbackSurcharge: 999n,
+        ctx,
+      });
+      clearInterval(heartbeatTimer);
+
+      assert.equal(killedRes.usedFallback, true);
+      assert.equal(killedRes.faultKind, "BUDGET_TIMEOUT_EXCEEDED");
+      assert.equal(killedRes.output, 999n);
+      assert.ok(
+        mainThreadHeartbeats >= 1,
+        "Main Node.js event loop remained responsive during WASM infinite loop"
+      );
+
+      //FAIL_CLOSED policy throws instead of silently falling back
+      await assert.rejects(() =>
+        host.executePreemptiveShippingSurchargeWasm({
+          pluginId: "rogue-infinite-loop",
+          fallbackSurcharge: 999n,
+          failurePolicy: "FAIL_CLOSED",
+          ctx,
+        })
+      );
+
+      // Sandbox automatically respawns a fresh clean worker for subsequent healthy plugins!
+      const healthyRes = await host.executePreemptiveShippingSurchargeWasm({
+        pluginId: "healthy-after-kill",
+        fallbackSurcharge: 0n,
+        ctx,
+      });
+      assert.equal(healthyRes.usedFallback, false);
+      assert.equal(healthyRes.output, 750n); // (3000 / 10) + 450 = 750
+    } finally {
+      await host.close();
+    }
+  });
 });

@@ -398,13 +398,13 @@ describe("@super-ecommerce/db", () => {
         const idx = connSeq++;
         const log: string[] = [];
         connectionSqlLogs.push(log);
-        const stream = createLoopbackPgWireStream((sql) => {
+        const stream = createLoopbackPgWireStream((sql, boundParams) => {
           log.push(sql);
-          if (sql.startsWith("SELECT 'item-")) {
+          if (sql === "SELECT $1 AS val" && boundParams?.[0]?.startsWith("item-")) {
             return {
               commandTag: "SELECT 1",
               columns: ["val"],
-              rows: [[sql]],
+              rows: [[boundParams[0]]],
             };
           }
           return {
@@ -475,39 +475,71 @@ describe("@super-ecommerce/db", () => {
     await pool.close();
     await txPool.close();
 
-    // Direct single-client concurrent query serialization without frame corruption
+    // Direct single-client concurrent Extended Query serialization without SQL text interpolation
     const directClient = new PgWireClient({
       host: "127.0.0.1",
       port: 5438,
       user: "super",
       database: "super_ecommerce",
-      stream: createLoopbackPgWireStream((sql) => ({
+      stream: createLoopbackPgWireStream((sql, boundParams) => ({
         commandTag: "SELECT 1",
-        columns: ["q"],
-        rows: [[sql]],
+        columns: ["q", "param0"],
+        rows: [[sql, boundParams?.[0] ?? null]],
       })),
     });
     await directClient.connect();
     const [r1, r2, r3] = await Promise.all([
-      directClient.query<{ q: string }>("SELECT $1", ["alpha"]),
-      directClient.query<{ q: string }>("SELECT $1", ["beta"]),
-      directClient.query<{ q: string }>("SELECT $1", ["gamma"]),
+      directClient.query<{ q: string; param0: string }>("SELECT $1", ["alpha"]),
+      directClient.query<{ q: string; param0: string }>("SELECT $1", ["beta'; DROP TABLE orders; --"]),
+      directClient.query<{ q: string; param0: string }>("SELECT $1", ["gamma"]),
     ]);
-    assert.equal(r1.rows[0]?.q, "SELECT 'alpha'");
-    assert.equal(r2.rows[0]?.q, "SELECT 'beta'");
-    assert.equal(r3.rows[0]?.q, "SELECT 'gamma'");
+    assert.equal(r1.rows[0]?.q, "SELECT $1");
+    assert.equal(r1.rows[0]?.param0, "alpha");
+    assert.equal(r2.rows[0]?.q, "SELECT $1");
+    assert.equal(r2.rows[0]?.param0, "beta'; DROP TABLE orders; --");
+    assert.equal(r3.rows[0]?.q, "SELECT $1");
+    assert.equal(r3.rows[0]?.param0, "gamma");
     await directClient.close();
+
+    // SSLRequest ('0x04d2162f') negotiation: ssl='require' succeeds on 'S' and rejects 'N'
+    const sslSupportedClient = new PgWireClient({
+      host: "db.cloud.example",
+      port: 5432,
+      user: "super",
+      database: "super_ecommerce",
+      ssl: "require",
+      stream: createLoopbackPgWireStream(
+        () => ({ commandTag: "SELECT 1", columns: ["tls"], rows: [["1"]] }),
+        { sslSupported: true }
+      ),
+    });
+    await sslSupportedClient.connect();
+    assert.equal(sslSupportedClient.isTlsEncrypted(), true);
+    await sslSupportedClient.close();
+
+    const sslRejectedClient = new PgWireClient({
+      host: "db.cloud.example",
+      port: 5432,
+      user: "super",
+      database: "super_ecommerce",
+      ssl: "require",
+      stream: createLoopbackPgWireStream(
+        () => ({ commandTag: "SELECT 1", columns: [], rows: [] }),
+        { sslSupported: false }
+      ),
+    });
+    await assert.rejects(() => sslRejectedClient.connect(), /SSL\/TLS/);
   });
 
   it("applies versioned PostgreSQL migrations idempotently on OfflinePgPool and enforces ACID rollback, keyset pagination, and CHECK constraints", async () => {
     const pg = new OfflinePgPool();
     try {
       const firstRun = await runMigrations(pg);
-      assert.deepEqual(firstRun.appliedVersions, ["0001", "0002", "0003"]);
+      assert.deepEqual(firstRun.appliedVersions, ["0001", "0002", "0003", "0004"]);
 
       const secondRun = await runMigrations(pg);
       assert.deepEqual(secondRun.appliedVersions, []);
-      assert.deepEqual(secondRun.alreadyAppliedVersions, ["0001", "0002", "0003"]);
+      assert.deepEqual(secondRun.alreadyAppliedVersions, ["0001", "0002", "0003", "0004"]);
 
       // 1. CHECK constraint rollback on msi_stock_slots
       await pg.query(

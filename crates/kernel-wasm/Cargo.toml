@@ -1,0 +1,15 @@
+[package]
+name = "kernel-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly (wasm32-unknown-unknown) isomorphic pricing, RMA, and B2B bindings compiled directly from commerce-kernel"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+commerce-kernel = { path = "../commerce-kernel" }
+
+[lints]
+workspace = true

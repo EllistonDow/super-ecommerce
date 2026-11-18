@@ -11,4 +11,6 @@ export * from "./orders-repository.ts";
 export * from "./order-fulfillment-workflow.ts";
 export * from "./customers-ledger.ts";
 export * from "./pg-admin-auth-rbac.ts";
+export * from "./double-entry-ledger.ts";
+export * from "./slotted-inventory.ts";
 

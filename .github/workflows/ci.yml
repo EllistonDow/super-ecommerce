@@ -50,16 +50,20 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates -> target
 
-      - name: Build native N-API cdylib addon
+      - name: Build native N-API cdylib addon and WASM kernel
         run: |
           cargo build --release --manifest-path crates/kernel-napi/Cargo.toml
+          cargo build --release --target wasm32-unknown-unknown --manifest-path crates/kernel-wasm/Cargo.toml
           mkdir -p packages/kernel/native
+          cp target/wasm32-unknown-unknown/release/kernel_wasm.wasm packages/kernel/native/commerce_kernel.wasm
           if [ -f "target/release/libkernel_napi.so" ]; then
             cp target/release/libkernel_napi.so packages/kernel/native/commerce_kernel.node
           elif [ -f "target/release/libkernel_napi.dylib" ]; then
@@ -107,17 +111,21 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates -> target
 
-      - name: Build native N-API cdylib addon
+      - name: Build native N-API cdylib addon and WASM kernel
         run: |
           cargo build --release --manifest-path crates/kernel-napi/Cargo.toml
+          cargo build --release --target wasm32-unknown-unknown --manifest-path crates/kernel-wasm/Cargo.toml
           mkdir -p packages/kernel/native
           cp target/release/libkernel_napi.so packages/kernel/native/commerce_kernel.node
+          cp target/wasm32-unknown-unknown/release/kernel_wasm.wasm packages/kernel/native/commerce_kernel.wasm
 
       - name: Setup Node.js 22.x
         uses: actions/setup-node@v4
@@ -131,6 +139,7 @@ jobs:
       - name: Run PostgreSQL 17 live integration test suite
         env:
           SUPER_PG_USE_WIRE: "1"
+          SUPER_PG_MIN_VERSION_NUM: "170000"
           SUPER_PG_HOST: 127.0.0.1
           SUPER_PG_PORT: "5432"
           SUPER_PG_USER: super

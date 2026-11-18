@@ -106,6 +106,8 @@ export interface CartLineInput {
   readonly taxRateBps: Bps;
   readonly isGift?: boolean;
   readonly candidateLineDiscounts?: readonly CandidateLineDiscount[];
+  readonly unitCostAmount?: MinorUnits;
+  readonly minMarginBps?: Bps;
 }
 
 export interface CartCalculationInput {
@@ -134,6 +136,7 @@ export interface CalculatedLineResult {
   readonly lineLevelDiscountAmount: MinorUnits;
   readonly subtotalAfterLineDiscount: MinorUnits;
   readonly allocatedOrderDiscountAmount: MinorUnits;
+  readonly marginGuardClampedAmount?: MinorUnits;
   readonly discountAttributions: readonly LineDiscountAttribution[];
   readonly totalNetAmount: MinorUnits;
   readonly totalTaxAmount: MinorUnits;
@@ -178,6 +181,44 @@ export function applyBps(amount: MinorUnits, bps: Bps): MinorUnits {
   }
   const clampedBps = BigInt(Math.min(Math.floor(bps), 10_000));
   return divRoundHalfUp(amount * clampedBps, MAX_BPS);
+}
+
+const ZERO_DECIMAL_CURRENCIES = new Set([
+  "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW",
+  "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
+]);
+const THREE_DECIMAL_CURRENCIES = new Set([
+  "BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND",
+]);
+const FOUR_DECIMAL_CURRENCIES = new Set(["CLF", "UYW"]);
+
+export function currencyExponent(currencyCode: string): number {
+  const native = getNativeRustKernel();
+  if (native) {
+    return native.rustCurrencyExponent(currencyCode);
+  }
+  const upper = currencyCode.trim().toUpperCase();
+  if (ZERO_DECIMAL_CURRENCIES.has(upper)) return 0;
+  if (THREE_DECIMAL_CURRENCIES.has(upper)) return 3;
+  if (FOUR_DECIMAL_CURRENCIES.has(upper)) return 4;
+  return 2;
+}
+
+export function formatMinorUnits(amount: MinorUnits, currencyCode: string): string {
+  const native = getNativeRustKernel();
+  if (native) {
+    return native.rustFormatMinorUnits(amount, currencyCode);
+  }
+  const exp = currencyExponent(currencyCode);
+  const sign = amount < 0n ? "-" : "";
+  const absVal = amount < 0n ? -amount : amount;
+  if (exp === 0) {
+    return `${sign}${absVal.toString()}`;
+  }
+  const scale = 10n ** BigInt(exp);
+  const major = absVal / scale;
+  const minor = (absVal % scale).toString().padStart(exp, "0");
+  return `${sign}${major.toString()}.${minor}`;
 }
 
 export function resolveTierUnitPrice(

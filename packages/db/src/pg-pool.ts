@@ -11,7 +11,9 @@
 import {
   PgWireClient,
   type PgConnectionOptions,
+  type PgQueryProtocolMode,
   type PgQueryResult,
+  type PgSslMode,
 } from "./pg-wire-driver.ts";
 
 export interface PgQueryable {
@@ -36,6 +38,8 @@ export interface PgPoolOptions {
   readonly user?: string;
   readonly password?: string;
   readonly database?: string;
+  readonly ssl?: PgSslMode;
+  readonly queryMode?: PgQueryProtocolMode;
   readonly maxConnections?: number;
   readonly statementTimeoutMs?: number;
   readonly idleTimeoutMs?: number;
@@ -54,12 +58,21 @@ export interface PgPoolStats {
 export function resolvePgConfigFromEnv(
   overrides?: Partial<PgConnectionOptions>
 ): PgConnectionOptions {
+  const envSsl = (process.env["SUPER_PG_SSL"] ?? "").trim().toLowerCase();
+  const defaultSsl: PgSslMode | undefined =
+    envSsl === "1" || envSsl === "true" || envSsl === "require"
+      ? "require"
+      : envSsl === "prefer"
+      ? "prefer"
+      : undefined;
   return {
     host: overrides?.host ?? process.env["SUPER_PG_HOST"] ?? "127.0.0.1",
     port: overrides?.port ?? Number(process.env["SUPER_PG_PORT"] ?? "5438"),
     user: overrides?.user ?? process.env["SUPER_PG_USER"] ?? "super",
     password: overrides?.password ?? process.env["SUPER_PG_PASSWORD"] ?? "superpassword",
     database: overrides?.database ?? process.env["SUPER_PG_DB"] ?? "super_ecommerce",
+    ssl: overrides?.ssl ?? defaultSsl,
+    queryMode: overrides?.queryMode,
     stream: overrides?.stream,
   };
 }

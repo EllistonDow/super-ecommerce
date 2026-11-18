@@ -26,6 +26,8 @@ import {
   type ShipmentSlice,
 } from "./inventory-service.ts";
 import { type OutboxStoreLike } from "./outbox-service.ts";
+import { persistNormalizedOrderLines } from "./orders-repository.ts";
+import { PgDoubleEntryLedgerService } from "./double-entry-ledger.ts";
 
 export interface PaymentCaptureResult {
   readonly transactionId: string;
@@ -238,6 +240,7 @@ export function buildCompleteCheckoutWorkflow(deps: CheckoutWorkflowDeps) {
       };
 
       if (deps.pgPool) {
+        const subledger = new PgDoubleEntryLedgerService(deps.pgPool);
         await deps.pgPool.withTransaction(async (tx) => {
           await tx.query(
             `INSERT INTO orders (
@@ -264,6 +267,8 @@ export function buildCompleteCheckoutWorkflow(deps: CheckoutWorkflowDeps) {
               order.createdAt,
             ]
           );
+          await persistNormalizedOrderLines(order, tx);
+          await subledger.recordOrderCaptureJournal(order, tx);
           await deps.outboxService.enqueue(outboxEventParams, tx);
         });
         deps.orderStore?.set(orderId, order);

@@ -8,6 +8,8 @@ import {
   runGatewayProtocolStressBenchmark,
 } from "./index.ts";
 import { createAppRequestHandler } from "./dev-server.ts";
+import { startProductionApiServer } from "./prod-server.ts";
+import { createBackgroundMaintenanceDaemon } from "./worker.ts";
 
 describe("@super-ecommerce/api — Dual-Protocol Gateway", () => {
   const gateway = createSuperCommerceGateway({
@@ -1324,5 +1326,124 @@ describe("Multi-route Merchant Backoffice", () => {
     assert.equal(body.database, "offline");
     assert.equal(body.pgVersion, null);
     assert.ok(Date.parse(body.timestamp) > 0);
+  });
+
+  it("serves OpenAPI 3.1, Streamable HTTP MCP (/mcp), SKU analytics, Trial Balance, and decoupled prod-server + worker", async () => {
+    const pg = new OfflinePgPool();
+    const prod = await startProductionApiServer({ port: 0, host: "127.0.0.1", pgPool: pg });
+    try {
+      const addr = prod.server.address();
+      assert.ok(addr && typeof addr === "object");
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+      // 1. OpenAPI 3.1 specification
+      const openApiRes = await fetch(`${baseUrl}/openapi.json`);
+      assert.equal(openApiRes.status, 200);
+      const spec = (await openApiRes.json()) as { openapi: string; paths: Record<string, unknown> };
+      assert.equal(spec.openapi, "3.1.0");
+      assert.ok(spec.paths["/mcp"]);
+      assert.ok(spec.paths["/rpc/ledger.getTrialBalance"]);
+
+      // 2. Streamable HTTP MCP JSON-RPC 2.0
+      const mcpInitRes = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 101, method: "initialize" }),
+      });
+      assert.equal(mcpInitRes.status, 200);
+      const mcpInit = (await mcpInitRes.json()) as { result: { serverInfo: { name: string } } };
+      assert.equal(mcpInit.result.serverInfo.name, "super-ecommerce-mcp");
+
+      // Seed stock & complete a checkout over HTTP /rpc/checkout.complete
+      await prod.gateway.inventoryService.upsertExternalSlots([
+        {
+          warehouseId: "WH-PROD-1",
+          priorityRank: 1,
+          linkedToChannel: true,
+          supportsShippingZone: true,
+          variantId: "SKU-PROD-DAC",
+          quantityOnHand: 5,
+          quantityReserved: 0,
+          quantityAllocated: 0,
+        },
+      ]);
+
+      const chkRes = await fetch(`${baseUrl}/rpc/checkout.complete`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "prod-http-chk-1",
+          input: {
+            checkoutId: "chk-prod-1",
+            channelSlug: "us-retail",
+            stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+            allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+            paymentToken: "tok_prod_1",
+            cart: {
+              currencyCode: "USD",
+              taxMode: "TAX_EXCLUSIVE",
+              shippingBaseAmount: 500,
+              shippingTaxRateBps: 0,
+              lines: [
+                {
+                  lineId: "L-DAC",
+                  variantId: "SKU-PROD-DAC",
+                  quantity: 1,
+                  baseUnitPrice: 25000,
+                  taxRateBps: 1000,
+                },
+              ],
+            },
+          },
+        }),
+      });
+      assert.equal(chkRes.status, 200);
+
+      // Verify normalized SKU analytics & Double-Entry Trial Balance over HTTP RPC
+      const skuRes = await fetch(`${baseUrl}/rpc/orders.analyticsBySku`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ channelSlug: "us-retail" }),
+      });
+      const skuBody = (await skuRes.json()) as { ok: boolean; data: { variantId: string; totalGrossAmount: string }[] };
+      assert.equal(skuBody.ok, true);
+      assert.equal(skuBody.data[0]?.variantId, "SKU-PROD-DAC");
+      assert.equal(skuBody.data[0]?.totalGrossAmount, "27500");
+
+      const tbRes = await fetch(`${baseUrl}/rpc/ledger.getTrialBalance`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ currencyCode: "USD" }),
+      });
+      const tbBody = (await tbRes.json()) as {
+        ok: boolean;
+        data: { isBalanced: boolean; grandTotalDebits: string; grandTotalCredits: string };
+      };
+      assert.equal(tbBody.ok, true);
+      assert.equal(tbBody.data.isBalanced, true);
+      assert.equal(tbBody.data.grandTotalDebits, "28000");
+      assert.equal(tbBody.data.grandTotalCredits, "28000");
+
+      // Run decoupled background worker daemon single cycle to drain the pending order.created outbox event
+      const deliveredEvents: string[] = [];
+      const workerDaemon = createBackgroundMaintenanceDaemon({
+        pgPool: pg,
+        outboxSubscribers: [
+          {
+            name: "erp-sync",
+            eventPattern: "order.*",
+            handle: (env) => {
+              deliveredEvents.push(env.event.eventType);
+            },
+          },
+        ],
+      });
+      const cycle = await workerDaemon.runSingleCycle();
+      assert.equal(cycle.outbox.publishedCount, 1);
+      assert.deepEqual(deliveredEvents, ["order.created"]);
+      await workerDaemon.stop(false);
+    } finally {
+      await prod.close();
+    }
   });
 });

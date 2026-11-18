@@ -34,7 +34,26 @@ export interface McpToolDescriptor {
     | "preview_store_config_diff";
   readonly persona: "MERCHANT_COPILOT" | "AGENTIC_STOREFRONT";
   readonly inputSchemaSummary: string;
+  readonly inputSchema: Record<string, unknown>;
   readonly description: string;
+}
+
+export interface McpJsonRpcRequest {
+  readonly jsonrpc: "2.0";
+  readonly id?: string | number | null;
+  readonly method: string;
+  readonly params?: Record<string, unknown>;
+}
+
+export interface McpJsonRpcResponse {
+  readonly jsonrpc: "2.0";
+  readonly id: string | number | null;
+  readonly result?: unknown;
+  readonly error?: {
+    readonly code: number;
+    readonly message: string;
+    readonly data?: unknown;
+  };
 }
 
 export interface CatalogHybridSearchQuery {
@@ -127,6 +146,18 @@ export class SuperCommerceMcpServer {
         name: "diagnose_price_waterfall",
         persona: "MERCHANT_COPILOT",
         inputSchemaSummary: "{ currencyCode, taxMode, lines[], candidateOrderDiscounts[] }",
+        inputSchema: {
+          type: "object",
+          required: ["currencyCode", "taxMode", "lines"],
+          properties: {
+            currencyCode: { type: "string", description: "ISO 4217 currency code (e.g. USD, EUR, JPY, KWD)" },
+            taxMode: { type: "string", enum: ["TAX_EXCLUSIVE", "TAX_INCLUSIVE"] },
+            shippingBaseAmount: { type: "string", description: "Minor units integer string" },
+            shippingTaxRateBps: { type: "integer", minimum: 0 },
+            lines: { type: "array", items: { type: "object" } },
+            candidateOrderDiscounts: { type: "array", items: { type: "object" } },
+          },
+        },
         description:
           "Executes the deterministic two-pass pricing kernel and returns per-line discount attribution, suppressed lower-precedence candidates, Hare-Niemeyer penny remainders, and gift-line exclusion.",
       },
@@ -134,6 +165,19 @@ export class SuperCommerceMcpServer {
         name: "diagnose_stock_availability_doctor",
         persona: "MERCHANT_COPILOT",
         inputSchemaSummary: "{ variantId, requestedQuantity, availabilityMode, slots[] }",
+        inputSchema: {
+          type: "object",
+          required: ["variantId", "requestedQuantity", "availabilityMode", "slots"],
+          properties: {
+            variantId: { type: "string" },
+            requestedQuantity: { type: "integer", minimum: 1 },
+            availabilityMode: {
+              type: "string",
+              enum: ["DIRECT_CHANNEL_WAREHOUSES", "LEGACY_SHIPPING_ZONE_WAREHOUSES"],
+            },
+            slots: { type: "array", items: { type: "object" } },
+          },
+        },
         description:
           "Audits MSI warehouse stock across DIRECT_CHANNEL_WAREHOUSES (3.23+) vs LEGACY_SHIPPING_ZONE_WAREHOUSES, pinpointing unlinked shipping zones and purchasability vs shippability gaps.",
       },
@@ -141,6 +185,19 @@ export class SuperCommerceMcpServer {
         name: "search_catalog_hybrid",
         persona: "AGENTIC_STOREFRONT",
         inputSchemaSummary: "{ channelSlug, queryText?, inStockOnly?, maxPriceAmount?, attributeFilters?, rrfK?, limit? }",
+        inputSchema: {
+          type: "object",
+          required: ["channelSlug"],
+          properties: {
+            channelSlug: { type: "string" },
+            queryText: { type: "string" },
+            inStockOnly: { type: "boolean" },
+            maxPriceAmount: { type: "string", description: "Max price in minor units" },
+            attributeFilters: { type: "object" },
+            rrfK: { type: "integer", minimum: 1 },
+            limit: { type: "integer", minimum: 1, maximum: 100 },
+          },
+        },
         description:
           "Searches zero-JOIN CQRS catalog channel projections using Okapi BM25 lexical scoring + 64D semantic vector cosine similarity fused via Reciprocal Rank Fusion (RRF, k=60) and JSONB facets.",
       },
@@ -148,6 +205,14 @@ export class SuperCommerceMcpServer {
         name: "preview_store_config_diff",
         persona: "MERCHANT_COPILOT",
         inputSchemaSummary: "{ remoteState: StoreConfigDocument, desiredConfig: StoreConfigDocument }",
+        inputSchema: {
+          type: "object",
+          required: ["remoteState", "desiredConfig"],
+          properties: {
+            remoteState: { type: "object" },
+            desiredConfig: { type: "object" },
+          },
+        },
         description:
           "Validates and diffs a desired Commerce-as-Code store configuration against current state in topological order (warehouses -> channels -> productTypes -> products).",
       },
@@ -437,6 +502,211 @@ export class SuperCommerceMcpServer {
     this.invocationLogs.unshift(log);
     if (this.invocationLogs.length > 25) {
       this.invocationLogs.length = 25;
+    }
+  }
+
+  /**
+   * Standard Model Context Protocol (MCP) JSON-RPC 2.0 dispatcher (`2025-03-26` / `2024-11-05`).
+   * Supports `initialize`, `notifications/initialized`, `ping`, `tools/list`, and `tools/call`
+   * identically across `stdio` CLI and Streamable HTTP (`POST /mcp`).
+   */
+  async handleJsonRpcMessage(
+    msg: McpJsonRpcRequest
+  ): Promise<McpJsonRpcResponse | null> {
+    if (!msg || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+      return {
+        jsonrpc: "2.0",
+        id: msg?.id ?? null,
+        error: { code: -32600, message: "Invalid JSON-RPC 2.0 request" },
+      };
+    }
+
+    // Notifications have no `id` and expect no JSON-RPC response frame
+    if (msg.id === undefined) {
+      return null;
+    }
+
+    const reqId = msg.id;
+
+    try {
+      switch (msg.method) {
+        case "initialize":
+          return {
+            jsonrpc: "2.0",
+            id: reqId,
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: {
+                tools: { listChanged: false },
+              },
+              serverInfo: {
+                name: "super-ecommerce-mcp",
+                version: "0.2.0",
+              },
+            },
+          };
+
+        case "ping":
+          return { jsonrpc: "2.0", id: reqId, result: {} };
+
+        case "tools/list":
+          return {
+            jsonrpc: "2.0",
+            id: reqId,
+            result: {
+              tools: this.listTools().map((t) => ({
+                name: t.name,
+                description: t.description,
+                inputSchema: t.inputSchema,
+              })),
+            },
+          };
+
+        case "tools/call": {
+          const toolName = msg.params?.["name"];
+          const rawArgs = (msg.params?.["arguments"] ?? {}) as Record<string, unknown>;
+
+          if (typeof toolName !== "string") {
+            return {
+              jsonrpc: "2.0",
+              id: reqId,
+              error: { code: -32602, message: "Missing string 'name' in tools/call params" },
+            };
+          }
+
+          let output: unknown;
+          switch (toolName) {
+            case "diagnose_price_waterfall": {
+              const rawLines = Array.isArray(rawArgs["lines"])
+                ? (rawArgs["lines"] as Record<string, unknown>[])
+                : [];
+              const coerceDiscount = (d: Record<string, unknown>) => {
+                const v = (d["value"] ?? {}) as Record<string, unknown>;
+                return {
+                  discountId: String(d["discountId"] ?? ""),
+                  name: String(d["name"] ?? ""),
+                  kind: d["kind"],
+                  value:
+                    v["type"] === "FIXED"
+                      ? { type: "FIXED" as const, amount: BigInt(String(v["amount"] ?? "0")) }
+                      : { type: "PERCENTAGE" as const, bps: Number(v["bps"] ?? 0) },
+                };
+              };
+              const normalizedInput: CartCalculationInput = {
+                currencyCode: String(rawArgs["currencyCode"] ?? "USD"),
+                taxMode:
+                  rawArgs["taxMode"] === "TAX_INCLUSIVE" ? "TAX_INCLUSIVE" : "TAX_EXCLUSIVE",
+                shippingBaseAmount: BigInt(String(rawArgs["shippingBaseAmount"] ?? "0")),
+                shippingTaxRateBps: Number(rawArgs["shippingTaxRateBps"] ?? 0),
+                lines: rawLines.map((l) => ({
+                  lineId: String(l["lineId"] ?? "L1"),
+                  variantId: String(l["variantId"] ?? "V1"),
+                  quantity: Number(l["quantity"] ?? 1),
+                  baseUnitPrice: BigInt(String(l["baseUnitPrice"] ?? "0")),
+                  taxRateBps: Number(l["taxRateBps"] ?? 0),
+                  isGift: Boolean(l["isGift"]),
+                  unitCostAmount:
+                    l["unitCostAmount"] !== undefined
+                      ? BigInt(String(l["unitCostAmount"]))
+                      : undefined,
+                  minMarginBps:
+                    l["minMarginBps"] !== undefined ? Number(l["minMarginBps"]) : undefined,
+                  candidateLineDiscounts: Array.isArray(l["candidateLineDiscounts"])
+                    ? (l["candidateLineDiscounts"] as Record<string, unknown>[]).map(
+                        coerceDiscount
+                      ) as CartCalculationInput["lines"][number]["candidateLineDiscounts"]
+                    : undefined,
+                })),
+                candidateOrderDiscounts: Array.isArray(rawArgs["candidateOrderDiscounts"])
+                  ? ((rawArgs["candidateOrderDiscounts"] as Record<string, unknown>[]).map(
+                      coerceDiscount
+                    ) as CartCalculationInput["candidateOrderDiscounts"])
+                  : undefined,
+              };
+              output = this.diagnosePriceWaterfall(normalizedInput);
+              break;
+            }
+            case "diagnose_stock_availability_doctor":
+              output = this.diagnoseStockAvailabilityDoctor(
+                rawArgs as unknown as StockAvailabilityDoctorInput
+              );
+              break;
+            case "search_catalog_hybrid":
+              output = this.searchCatalogHybridDetailed({
+                channelSlug: String(rawArgs["channelSlug"] ?? "us-retail"),
+                queryText:
+                  typeof rawArgs["queryText"] === "string" ? rawArgs["queryText"] : undefined,
+                inStockOnly:
+                  typeof rawArgs["inStockOnly"] === "boolean"
+                    ? rawArgs["inStockOnly"]
+                    : undefined,
+                maxPriceAmount:
+                  rawArgs["maxPriceAmount"] !== undefined
+                    ? BigInt(String(rawArgs["maxPriceAmount"]))
+                    : undefined,
+                attributeFilters:
+                  rawArgs["attributeFilters"] && typeof rawArgs["attributeFilters"] === "object"
+                    ? (rawArgs["attributeFilters"] as Record<string, string | number | boolean>)
+                    : undefined,
+                rrfK: typeof rawArgs["rrfK"] === "number" ? rawArgs["rrfK"] : undefined,
+                limit: typeof rawArgs["limit"] === "number" ? rawArgs["limit"] : undefined,
+              });
+              break;
+            case "preview_store_config_diff":
+              output = this.previewStoreConfigDiff(
+                rawArgs as unknown as {
+                  remoteState: StoreConfigDocument;
+                  desiredConfig: StoreConfigDocument;
+                }
+              );
+              break;
+            default:
+              return {
+                jsonrpc: "2.0",
+                id: reqId,
+                error: { code: -32601, message: `Unknown MCP tool '${toolName}'` },
+              };
+          }
+
+          const serialized = JSON.stringify(
+            output,
+            (_k, v) => (typeof v === "bigint" ? v.toString() : v),
+            2
+          );
+          return {
+            jsonrpc: "2.0",
+            id: reqId,
+            result: {
+              content: [{ type: "text", text: serialized }],
+              isError: false,
+            },
+          };
+        }
+
+        default:
+          return {
+            jsonrpc: "2.0",
+            id: reqId,
+            error: {
+              code: -32601,
+              message: `Method not found: '${msg.method}'`,
+            },
+          };
+      }
+    } catch (err) {
+      return {
+        jsonrpc: "2.0",
+        id: reqId,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: err instanceof Error ? err.message : String(err),
+            },
+          ],
+          isError: true,
+        },
+      };
     }
   }
 }

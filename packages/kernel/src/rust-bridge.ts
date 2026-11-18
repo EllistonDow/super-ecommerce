@@ -1,11 +1,10 @@
 /**
- * Native Rust N-API (`.node`) Bridge for `@super-ecommerce/kernel`.
+ * Native Rust N-API (`.node`) Bridge & Shared Escaped Wire Codec for `@super-ecommerce/kernel`.
  *
  * Dynamically loads `../native/commerce_kernel.node` (compiled from `crates/kernel-napi`
- * + `crates/commerce-kernel`) when running on Node.js / Bun, routing `applyBps`,
- * `allocateProRata`, `calculateCart`, and `planInventoryAllocation` directly into the
- * native Rust binary. Falls back transparently to the isomorphic BigInt engine in
- * browser-only environments.
+ * + `crates/commerce-kernel`) when running on Node.js / Bun.
+ * All record strings are losslessly escaped (`\\`, `\t`, `\n`, `\r`) to prevent
+ * control-character injection across both N-API and WASM boundaries.
  */
 
 import { createRequire } from "node:module";
@@ -29,14 +28,56 @@ import type {
   WeightedItem,
 } from "./index.ts";
 
-interface NativeRustKernelBinding {
+export interface NativeRustKernelBinding {
   rustApplyBps(amount: bigint, bps: number): bigint;
+  rustCurrencyExponent(currencyCode: string): number;
+  rustFormatMinorUnits(amount: bigint, currencyCode: string): string;
   rustAllocateProRata(totalToAllocate: bigint, encodedItems: string): string;
   rustCalculateCart(encodedCart: string): string;
   rustPlanInventoryAllocation(encodedMsi: string): string;
   rustBenchmarkKernel(iterations: number): string;
   rustCalculateReturnRefund(encodedRma: string): string;
   rustEvaluateB2bPurchasePolicy(encodedB2b: string): string;
+}
+
+export function escapeWireField(raw: string): string {
+  let needsEscape = false;
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code === 9 || code === 10 || code === 13 || code === 92) {
+      needsEscape = true;
+      break;
+    }
+  }
+  if (!needsEscape) {
+    return raw;
+  }
+  return raw
+    .replaceAll("\\", "\\\\")
+    .replaceAll("\t", "\\t")
+    .replaceAll("\n", "\\n")
+    .replaceAll("\r", "\\r");
+}
+
+export function unescapeWireField(escaped: string): string {
+  if (!escaped.includes("\\")) {
+    return escaped;
+  }
+  let out = "";
+  for (let i = 0; i < escaped.length; i++) {
+    const ch = escaped[i]!;
+    if (ch === "\\" && i + 1 < escaped.length) {
+      const next = escaped[++i]!;
+      if (next === "t") out += "\t";
+      else if (next === "n") out += "\n";
+      else if (next === "r") out += "\r";
+      else if (next === "\\") out += "\\";
+      else out += "\\" + next;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
 }
 
 let cachedNativeBinding: NativeRustKernelBinding | null | undefined;
@@ -65,42 +106,50 @@ export function isNativeRustKernelLoaded(): boolean {
   return getNativeRustKernel() !== null;
 }
 
+export function encodeProRataPayload(items: readonly WeightedItem[]): string {
+  return items
+    .map((i) => `${escapeWireField(i.id)}\t${i.weight.toString()}`)
+    .join("\n");
+}
+
+export function decodeProRataPayload(rawOut: string): AllocatedShare[] {
+  if (!rawOut.trim()) return [];
+  return rawOut.split("\n").map((line) => {
+    const [id, allocStr] = line.split("\t");
+    return {
+      id: unescapeWireField(id ?? ""),
+      allocated: BigInt(allocStr ?? "0"),
+    };
+  });
+}
+
 export function allocateProRataViaRust(
   binding: NativeRustKernelBinding,
   totalToAllocate: MinorUnits,
   items: readonly WeightedItem[]
 ): AllocatedShare[] {
   if (items.length === 0) return [];
-  const encoded = items
-    .map((i) => `${i.id.replaceAll("\t", " ")}\t${i.weight.toString()}`)
-    .join("\n");
-  const rawOut = binding.rustAllocateProRata(totalToAllocate, encoded);
-  if (!rawOut.trim()) return [];
-  return rawOut.split("\n").map((line) => {
-    const [id, allocStr] = line.split("\t");
-    return {
-      id: id ?? "",
-      allocated: BigInt(allocStr ?? "0"),
-    };
-  });
+  const rawOut = binding.rustAllocateProRata(totalToAllocate, encodeProRataPayload(items));
+  return decodeProRataPayload(rawOut);
 }
 
-export function calculateCartViaRust(
-  binding: NativeRustKernelBinding,
-  input: CartCalculationInput
-): CartCalculationResult {
+export function encodeCartPayload(input: CartCalculationInput): string {
   const records: string[] = [];
   records.push(
-    `CART\t${input.currencyCode}\t${input.taxMode}\t${input.shippingBaseAmount.toString()}\t${Math.floor(input.shippingTaxRateBps)}`
+    `CART\t${escapeWireField(input.currencyCode)}\t${input.taxMode}\t${input.shippingBaseAmount.toString()}\t${Math.floor(input.shippingTaxRateBps)}`
   );
 
   for (const line of input.lines) {
+    const costCol =
+      line.unitCostAmount !== undefined ? line.unitCostAmount.toString() : "";
+    const minMarginCol =
+      line.minMarginBps !== undefined ? Math.floor(line.minMarginBps).toString() : "0";
     records.push(
-      `LINE\t${line.lineId}\t${line.variantId}\t${line.quantity}\t${line.baseUnitPrice.toString()}\t${Math.floor(line.taxRateBps)}\t${line.isGift ? 1 : 0}`
+      `LINE\t${escapeWireField(line.lineId)}\t${escapeWireField(line.variantId)}\t${line.quantity}\t${line.baseUnitPrice.toString()}\t${Math.floor(line.taxRateBps)}\t${line.isGift ? 1 : 0}\t${costCol}\t${minMarginCol}`
     );
     for (const tier of line.tierPrices ?? []) {
       records.push(
-        `TIER\t${line.lineId}\t${tier.minQuantity}\t${tier.unitAmount.toString()}`
+        `TIER\t${escapeWireField(line.lineId)}\t${tier.minQuantity}\t${tier.unitAmount.toString()}`
       );
     }
     for (const ld of line.candidateLineDiscounts ?? []) {
@@ -110,7 +159,7 @@ export function calculateCartViaRust(
           ? ld.value.amount.toString()
           : Math.floor(ld.value.bps).toString();
       records.push(
-        `LDISC\t${line.lineId}\t${ld.discountId}\t${ld.name}\t${ld.kind}\t${valType}\t${valNum}`
+        `LDISC\t${escapeWireField(line.lineId)}\t${escapeWireField(ld.discountId)}\t${escapeWireField(ld.name)}\t${ld.kind}\t${valType}\t${valNum}`
       );
     }
   }
@@ -122,13 +171,18 @@ export function calculateCartViaRust(
         ? od.value.amount.toString()
         : Math.floor(od.value.bps).toString();
     records.push(
-      `ODISC\t${od.discountId}\t${od.name}\t${od.kind}\t${valType}\t${valNum}`
+      `ODISC\t${escapeWireField(od.discountId)}\t${escapeWireField(od.name)}\t${od.kind}\t${valType}\t${valNum}`
     );
   }
 
-  const rawOut = binding.rustCalculateCart(records.join("\n"));
+  return records.join("\n");
+}
 
-  let currencyCode = input.currencyCode;
+export function decodeCartPayload(
+  rawOut: string,
+  fallbackCurrencyCode: string
+): CartCalculationResult {
+  let currencyCode = fallbackCurrencyCode;
   let shippingUndiscountedAmount = 0n;
   let shippingDiscountAmount = 0n;
   let shippingNetAmount = 0n;
@@ -153,7 +207,7 @@ export function calculateCartViaRust(
     const tag = cols[0];
 
     if (tag === "TOTALS" && cols.length >= 10) {
-      currencyCode = cols[1]!;
+      currencyCode = unescapeWireField(cols[1]!);
       shippingUndiscountedAmount = BigInt(cols[2]!);
       shippingDiscountAmount = BigInt(cols[3]!);
       shippingNetAmount = BigInt(cols[4]!);
@@ -164,17 +218,17 @@ export function calculateCartViaRust(
       totalGrossAmount = BigInt(cols[9]!);
     } else if (tag === "APPLIED_ODISC" && cols.length >= 5) {
       appliedOrderDiscounts.push({
-        discountId: cols[1]!,
-        name: cols[2]!,
+        discountId: unescapeWireField(cols[1]!),
+        name: unescapeWireField(cols[2]!),
         kind: cols[3] as OrderDiscountKind,
         totalAmount: BigInt(cols[4]!),
       });
     } else if (tag === "LINE_RES" && cols.length >= 13) {
-      const lineId = cols[1]!;
+      const lineId = unescapeWireField(cols[1]!);
       lineMap.set(lineId, {
         base: {
           lineId,
-          variantId: cols[2]!,
+          variantId: unescapeWireField(cols[2]!),
           quantity: Number(cols[3]!),
           isGift: cols[4] === "1",
           effectiveBaseUnitPrice: BigInt(cols[5]!),
@@ -182,6 +236,7 @@ export function calculateCartViaRust(
           lineLevelDiscountAmount: BigInt(cols[7]!),
           subtotalAfterLineDiscount: BigInt(cols[8]!),
           allocatedOrderDiscountAmount: BigInt(cols[9]!),
+          marginGuardClampedAmount: cols.length >= 14 ? BigInt(cols[13]!) : 0n,
           totalNetAmount: BigInt(cols[10]!),
           totalTaxAmount: BigInt(cols[11]!),
           totalGrossAmount: BigInt(cols[12]!),
@@ -189,11 +244,11 @@ export function calculateCartViaRust(
         attributions: [],
       });
     } else if (tag === "LINE_ATTR" && cols.length >= 6) {
-      const targetLine = lineMap.get(cols[1]!);
+      const targetLine = lineMap.get(unescapeWireField(cols[1]!));
       if (targetLine) {
         targetLine.attributions.push({
-          discountId: cols[2]!,
-          name: cols[3]!,
+          discountId: unescapeWireField(cols[2]!),
+          name: unescapeWireField(cols[3]!),
           isOrderLevel: cols[4] === "1",
           amount: BigInt(cols[5]!),
         });
@@ -219,6 +274,14 @@ export function calculateCartViaRust(
     totalTaxAmount,
     totalGrossAmount,
   };
+}
+
+export function calculateCartViaRust(
+  binding: NativeRustKernelBinding,
+  input: CartCalculationInput
+): CartCalculationResult {
+  const rawOut = binding.rustCalculateCart(encodeCartPayload(input));
+  return decodeCartPayload(rawOut, input.currencyCode);
 }
 
 export interface RustMsiPlanningInput {
@@ -265,11 +328,13 @@ export function planInventoryAllocationViaRust(
   lines.push(`CFG\t${input.availabilityMode}\t${input.strategy}`);
   for (const s of input.slots) {
     lines.push(
-      `SLOT\t${s.warehouseId}\t${s.priorityRank}\t${s.linkedToChannel ? 1 : 0}\t${s.supportsShippingZone ? 1 : 0}\t${s.variantId}\t${s.onHand}\t${s.reserved}\t${s.allocated}`
+      `SLOT\t${escapeWireField(s.warehouseId)}\t${s.priorityRank}\t${s.linkedToChannel ? 1 : 0}\t${s.supportsShippingZone ? 1 : 0}\t${escapeWireField(s.variantId)}\t${s.onHand}\t${s.reserved}\t${s.allocated}`
     );
   }
   for (const d of input.demands) {
-    lines.push(`DEMAND\t${d.lineId}\t${d.variantId}\t${d.quantity}`);
+    lines.push(
+      `DEMAND\t${escapeWireField(d.lineId)}\t${escapeWireField(d.variantId)}\t${d.quantity}`
+    );
   }
 
   const rawOut = binding.rustPlanInventoryAllocation(lines.join("\n"));
@@ -295,15 +360,15 @@ export function planInventoryAllocationViaRust(
       shipmentCount = Number(cols[2] ?? "0");
     } else if (cols[0] === "ALLOC" && cols.length >= 5) {
       allocations.push({
-        warehouseId: cols[1]!,
-        lineId: cols[2]!,
-        variantId: cols[3]!,
+        warehouseId: unescapeWireField(cols[1]!),
+        lineId: unescapeWireField(cols[2]!),
+        variantId: unescapeWireField(cols[3]!),
         quantityAllocated: Number(cols[4]!),
       });
     } else if (cols[0] === "SHORTFALL" && cols.length >= 6) {
       unallocatedLines.push({
-        lineId: cols[1]!,
-        variantId: cols[2]!,
+        lineId: unescapeWireField(cols[1]!),
+        variantId: unescapeWireField(cols[2]!),
         missingQuantity: Number(cols[5]!),
       });
     }
@@ -343,10 +408,7 @@ export function benchmarkNativeRustKernel(
   };
 }
 
-export function calculateReturnRefundViaRust(
-  binding: NativeRustKernelBinding,
-  input: RefundCalculationInput
-): RefundCalculationResult {
+export function encodeReturnRefundPayload(input: RefundCalculationInput): string {
   const rows: string[] = [];
   const shipOrigNet = input.shippingOriginalNetAmount ?? 0n;
   const shipOrigTax = input.shippingOriginalTaxAmount ?? 0n;
@@ -361,7 +423,7 @@ export function calculateReturnRefundViaRust(
   rows.push(
     [
       "RMA_CFG",
-      input.currencyCode,
+      escapeWireField(input.currencyCode),
       input.refundShipping ? "1" : "0",
       shipOrigNet.toString(),
       shipOrigTax.toString(),
@@ -379,8 +441,8 @@ export function calculateReturnRefundViaRust(
     rows.push(
       [
         "RMA_LINE",
-        line.lineId,
-        line.variantId,
+        escapeWireField(line.lineId),
+        escapeWireField(line.variantId),
         Math.floor(line.originalQuantity),
         Math.floor(line.alreadyReturnedQuantity),
         Math.floor(line.returnQuantityRequested),
@@ -395,10 +457,14 @@ export function calculateReturnRefundViaRust(
       ].join("\t")
     );
   }
+  return rows.join("\n");
+}
 
-  const rawOut = binding.rustCalculateReturnRefund(rows.join("\n"));
-
-  let currencyCode = input.currencyCode;
+export function decodeReturnRefundPayload(
+  rawOut: string,
+  fallbackCurrencyCode: string
+): RefundCalculationResult {
+  let currencyCode = fallbackCurrencyCode;
   let shippingRefundNetAmount = 0n;
   let shippingRefundTaxAmount = 0n;
   let shippingRefundGrossAmount = 0n;
@@ -416,7 +482,7 @@ export function calculateReturnRefundViaRust(
     if (!row.trim()) continue;
     const cols = row.split("\t");
     if (cols[0] === "RMA_TOTALS" && cols.length >= 13) {
-      currencyCode = cols[1]!;
+      currencyCode = unescapeWireField(cols[1]!);
       shippingRefundNetAmount = BigInt(cols[2]!);
       shippingRefundTaxAmount = BigInt(cols[3]!);
       shippingRefundGrossAmount = BigInt(cols[4]!);
@@ -430,8 +496,8 @@ export function calculateReturnRefundViaRust(
       unallocatedRefundOverflow = BigInt(cols[12]!);
     } else if (cols[0] === "RMA_LINE_RES" && cols.length >= 16) {
       lines.push({
-        lineId: cols[1]!,
-        variantId: cols[2]!,
+        lineId: unescapeWireField(cols[1]!),
+        variantId: unescapeWireField(cols[2]!),
         isGift: cols[3] === "1",
         originalQuantity: Number(cols[4]!),
         alreadyReturnedQuantity: Number(cols[5]!),
@@ -466,15 +532,20 @@ export function calculateReturnRefundViaRust(
   };
 }
 
-export function evaluateB2bPurchasePolicyViaRust(
+export function calculateReturnRefundViaRust(
   binding: NativeRustKernelBinding,
-  input: B2bPurchasePolicyInput
-): B2bPurchasePolicyResult {
+  input: RefundCalculationInput
+): RefundCalculationResult {
+  const rawOut = binding.rustCalculateReturnRefund(encodeReturnRefundPayload(input));
+  return decodeReturnRefundPayload(rawOut, input.currencyCode);
+}
+
+export function encodeB2bPolicyPayload(input: B2bPurchasePolicyInput): string {
   const records: string[] = [];
   records.push(
     [
       "B2B_COMPANY",
-      input.company.companyId,
+      escapeWireField(input.company.companyId),
       input.company.paymentTerms,
       input.company.creditLimit.toString(),
       input.company.creditUsed.toString(),
@@ -486,7 +557,7 @@ export function evaluateB2bPurchasePolicyViaRust(
   records.push(
     [
       "B2B_CC",
-      input.costCenter.costCenterId,
+      escapeWireField(input.costCenter.costCenterId),
       input.costCenter.monthlyBudget.toString(),
       input.costCenter.monthlySpent.toString(),
       (input.costCenter.monthlyReserved ?? 0n).toString(),
@@ -495,50 +566,19 @@ export function evaluateB2bPurchasePolicyViaRust(
   records.push(
     [
       "B2B_BUYER",
-      input.buyer.buyerId,
+      escapeWireField(input.buyer.buyerId),
       input.buyer.role,
       input.buyer.singleOrderAutoApproveLimit.toString(),
     ].join("\t")
   );
+  records.push(encodeCartPayload(input.cart));
+  return records.join("\n");
+}
 
-  records.push(
-    `CART\t${input.cart.currencyCode}\t${input.cart.taxMode}\t${input.cart.shippingBaseAmount.toString()}\t${Math.floor(input.cart.shippingTaxRateBps)}`
-  );
-
-  for (const line of input.cart.lines) {
-    records.push(
-      `LINE\t${line.lineId}\t${line.variantId}\t${line.quantity}\t${line.baseUnitPrice.toString()}\t${Math.floor(line.taxRateBps)}\t${line.isGift ? 1 : 0}`
-    );
-    for (const tier of line.tierPrices ?? []) {
-      records.push(
-        `TIER\t${line.lineId}\t${tier.minQuantity}\t${tier.unitAmount.toString()}`
-      );
-    }
-    for (const ld of line.candidateLineDiscounts ?? []) {
-      const valType = ld.value.type;
-      const valNum =
-        ld.value.type === "FIXED"
-          ? ld.value.amount.toString()
-          : Math.floor(ld.value.bps).toString();
-      records.push(
-        `LDISC\t${line.lineId}\t${ld.discountId}\t${ld.name}\t${ld.kind}\t${valType}\t${valNum}`
-      );
-    }
-  }
-
-  for (const od of input.cart.candidateOrderDiscounts ?? []) {
-    const valType = od.value.type;
-    const valNum =
-      od.value.type === "FIXED"
-        ? od.value.amount.toString()
-        : Math.floor(od.value.bps).toString();
-    records.push(
-      `ODISC\t${od.discountId}\t${od.name}\t${od.kind}\t${valType}\t${valNum}`
-    );
-  }
-
-  const rawOut = binding.rustEvaluateB2bPurchasePolicy(records.join("\n"));
-
+export function decodeB2bPolicyPayload(
+  rawOut: string,
+  fallbackCurrencyCode: string
+): B2bPurchasePolicyResult {
   let decision: B2bPurchasePolicyResult["decision"] = "APPROVED_AUTO";
   let standardTaxAmountWithoutExemption = 0n;
   let taxExemptSavingsAmount = 0n;
@@ -550,30 +590,10 @@ export function evaluateB2bPurchasePolicyViaRust(
   let recommendedReservationTtlSeconds = 900;
   const approvalReasons: string[] = [];
 
-  let currencyCode = input.cart.currencyCode;
-  let shippingUndiscountedAmount = 0n;
-  let shippingDiscountAmount = 0n;
-  let shippingNetAmount = 0n;
-  let shippingTaxAmount = 0n;
-  let shippingGrossAmount = 0n;
-  let totalNetAmount = 0n;
-  let totalTaxAmount = 0n;
-  let totalGrossAmount = 0n;
-
-  const appliedOrderDiscounts: AppliedOrderDiscountSummary[] = [];
-  const lineMap = new Map<
-    string,
-    {
-      base: Omit<CalculatedLineResult, "discountAttributions">;
-      attributions: LineDiscountAttribution[];
-    }
-  >();
-
   for (const row of rawOut.split("\n")) {
     if (!row.trim()) continue;
     const cols = row.split("\t");
     const tag = cols[0];
-
     if (tag === "B2B_DECISION" && cols.length >= 10) {
       decision = cols[1] as B2bPurchasePolicyResult["decision"];
       standardTaxAmountWithoutExemption = BigInt(cols[2]!);
@@ -585,77 +605,15 @@ export function evaluateB2bPurchasePolicyViaRust(
       netTermsDueDays = Number(cols[8]!);
       recommendedReservationTtlSeconds = Number(cols[9]!);
     } else if (tag === "B2B_REASON" && cols.length >= 2) {
-      approvalReasons.push(cols[1]!);
-    } else if (tag === "TOTALS" && cols.length >= 10) {
-      currencyCode = cols[1]!;
-      shippingUndiscountedAmount = BigInt(cols[2]!);
-      shippingDiscountAmount = BigInt(cols[3]!);
-      shippingNetAmount = BigInt(cols[4]!);
-      shippingTaxAmount = BigInt(cols[5]!);
-      shippingGrossAmount = BigInt(cols[6]!);
-      totalNetAmount = BigInt(cols[7]!);
-      totalTaxAmount = BigInt(cols[8]!);
-      totalGrossAmount = BigInt(cols[9]!);
-    } else if (tag === "APPLIED_ODISC" && cols.length >= 5) {
-      appliedOrderDiscounts.push({
-        discountId: cols[1]!,
-        name: cols[2]!,
-        kind: cols[3] as OrderDiscountKind,
-        totalAmount: BigInt(cols[4]!),
-      });
-    } else if (tag === "LINE_RES" && cols.length >= 13) {
-      const lineId = cols[1]!;
-      lineMap.set(lineId, {
-        base: {
-          lineId,
-          variantId: cols[2]!,
-          quantity: Number(cols[3]!),
-          isGift: cols[4] === "1",
-          effectiveBaseUnitPrice: BigInt(cols[5]!),
-          undiscountedLineSubtotal: BigInt(cols[6]!),
-          lineLevelDiscountAmount: BigInt(cols[7]!),
-          subtotalAfterLineDiscount: BigInt(cols[8]!),
-          allocatedOrderDiscountAmount: BigInt(cols[9]!),
-          totalNetAmount: BigInt(cols[10]!),
-          totalTaxAmount: BigInt(cols[11]!),
-          totalGrossAmount: BigInt(cols[12]!),
-        },
-        attributions: [],
-      });
-    } else if (tag === "LINE_ATTR" && cols.length >= 6) {
-      const targetLine = lineMap.get(cols[1]!);
-      if (targetLine) {
-        targetLine.attributions.push({
-          discountId: cols[2]!,
-          name: cols[3]!,
-          isOrderLevel: cols[4] === "1",
-          amount: BigInt(cols[5]!),
-        });
-      }
+      approvalReasons.push(unescapeWireField(cols[1]!));
     }
   }
 
-  const lines: CalculatedLineResult[] = Array.from(lineMap.values()).map((entry) => ({
-    ...entry.base,
-    discountAttributions: entry.attributions,
-  }));
-
+  const pricing = decodeCartPayload(rawOut, fallbackCurrencyCode);
   return {
     decision,
     approvalReasons,
-    pricing: {
-      currencyCode,
-      lines,
-      appliedOrderDiscounts,
-      shippingUndiscountedAmount,
-      shippingDiscountAmount,
-      shippingNetAmount,
-      shippingTaxAmount,
-      shippingGrossAmount,
-      totalNetAmount,
-      totalTaxAmount,
-      totalGrossAmount,
-    },
+    pricing,
     standardTaxAmountWithoutExemption,
     taxExemptSavingsAmount,
     availableCompanyCreditBefore,
@@ -667,4 +625,10 @@ export function evaluateB2bPurchasePolicyViaRust(
   };
 }
 
-
+export function evaluateB2bPurchasePolicyViaRust(
+  binding: NativeRustKernelBinding,
+  input: B2bPurchasePolicyInput
+): B2bPurchasePolicyResult {
+  const rawOut = binding.rustEvaluateB2bPurchasePolicy(encodeB2bPolicyPayload(input));
+  return decodeB2bPolicyPayload(rawOut, input.cart.currencyCode);
+}

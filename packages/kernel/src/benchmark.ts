@@ -198,6 +198,11 @@ export async function runKernelBenchmarkSuite(options?: {
     ],
   };
 
+  // Warm up V8 JIT on encodeCartPayload / decodeCartPayload before percentile sampling
+  for (let w = 0; w < 64; w++) {
+    calculateCart(sampleCart);
+  }
+
   const napiCartIters = Math.max(500, Math.round(5_000 * scale));
   const napiCartSamplesNs: bigint[] = [];
   const napiCartStart = process.hrtime.bigint();

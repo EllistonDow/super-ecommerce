@@ -47,5 +47,24 @@ services:
       retries: 3
       start_period: 15s
 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-ecommerce-worker
+    command: ["node", "--experimental-strip-types", "apps/api/src/worker.ts"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      SUPER_PG_USE_WIRE: "1"
+      SUPER_PG_HOST: postgres
+      SUPER_PG_PORT: "5432"
+      SUPER_PG_USER: ${SUPER_PG_USER:-super}
+      SUPER_PG_PASSWORD: ${SUPER_PG_PASSWORD:-superpassword}
+      SUPER_PG_DB: ${SUPER_PG_DB:-super_ecommerce}
+
 volumes:
   pg17_data:

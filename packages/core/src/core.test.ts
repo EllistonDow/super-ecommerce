@@ -14,10 +14,14 @@ import {
   PgAdminAuthRbacService,
   PgB2bOrganizationService,
   PgCustomersService,
+  PgDoubleEntryLedgerService,
   PgMsiInventoryService,
+  PgOrdersRepository,
   PgReservationTtlReaperService,
+  PgSlottedInventoryService,
   PgStripeWebhookService,
   PgTransactionalOutboxService,
+  UnbalancedJournalError,
   ReservationTtlReaperService,
   signStripeWebhookPayload,
   StripeWebhookService,
@@ -2460,6 +2464,177 @@ describe("@super-ecommerce/core — PostgreSQL Primary Stores (PgPoolLike)", () 
       assert.equal(authActions.some((a) => a.includes("LOGIN (SUCCESS)")), true);
       assert.equal(authActions.some((a) => a.includes("LOGIN (FAILED)")), true);
       assert.equal(authActions.some((a) => a.includes("INJECT CHAOS FAULT")), true);
+    } finally {
+      await pg.close();
+    }
+  });
+
+  it("enforces 16-shard slotted flash-sale stock concurrency, HOT availability updates, normalized order_lines analytics, and balanced Double-Entry Subledger", async () => {
+    const pg = new OfflinePgPool();
+    await runMigrations(pg);
+    try {
+      // 1. 16-Shard Flash-Sale Inventory: 35 concurrent buyers competing for 20 units -> exact 20 succeed, 15 fail, 0 oversold
+      const slotted = new PgSlottedInventoryService(pg, { shardCount: 16 });
+      await slotted.seedShardedStock({
+        warehouseId: "WH-FLASH",
+        variantId: "SKU-LIMITED-DROP",
+        totalQuantity: 20,
+      });
+
+      const outcomes = await Promise.allSettled(
+        Array.from({ length: 35 }, (_, idx) =>
+          slotted.claimFlashSaleStock({
+            lineId: `flash-line-${idx}`,
+            warehouseId: "WH-FLASH",
+            variantId: "SKU-LIMITED-DROP",
+            quantity: 1,
+          })
+        )
+      );
+
+      const succeeded = outcomes.filter((o) => o.status === "fulfilled");
+      const rejected = outcomes.filter((o) => o.status === "rejected");
+      assert.equal(succeeded.length, 20);
+      assert.equal(rejected.length, 15);
+
+      const postDropBalances = await slotted.getTotalBalances("WH-FLASH", "SKU-LIMITED-DROP");
+      assert.equal(postDropBalances.totalAvailable, 0);
+      assert.equal(postDropBalances.totalAllocated, 20);
+
+      // Hot/Cold CQRS split update
+      await slotted.upsertHotAvailability({
+        channelSlug: "us-retail",
+        productId: "prod-drop-1",
+        isInStock: false,
+        totalAvailableQty: 0,
+      });
+      const hotSnap = await slotted.getHotAvailability("us-retail", "prod-drop-1");
+      assert.equal(hotSnap?.isInStock, false);
+      assert.equal(hotSnap?.totalAvailableQty, 0);
+
+      // 2. Checkout + Partial RMA with Restocking Fee -> Normalized order_lines + Balanced Double-Entry Subledger
+      const inv = new PgMsiInventoryService(pg);
+      await inv.upsertExternalSlots([
+        {
+          warehouseId: "WH-EAST",
+          priorityRank: 1,
+          linkedToChannel: true,
+          supportsShippingZone: true,
+          variantId: "SKU-TI-KB",
+          quantityOnHand: 10,
+          quantityReserved: 0,
+          quantityAllocated: 0,
+        },
+      ]);
+      const outbox = new PgTransactionalOutboxService(pg);
+      const wfStore = new PgWorkflowStateStore(pg);
+      const custSvc = new PgCustomersService(pg);
+      await custSvc.createCustomer({
+        customerId: "cust-ledger-1",
+        email: "ledger@kronos.io",
+        fullName: "Ledger Buyer",
+      });
+      await custSvc.addStoreCredit({
+        customerId: "cust-ledger-1",
+        amount: 5_000n,
+        reason: "Initial credit",
+      });
+
+      const gateway: PaymentGatewayStrategy = {
+        async capture({ checkoutId, amount }) {
+          return { transactionId: `pi_${checkoutId}`, provider: "stripe", capturedAmount: amount };
+        },
+        async voidOrRefund() {},
+      };
+
+      const checkoutWf = buildCompleteCheckoutWorkflow({
+        inventoryService: inv,
+        paymentGateway: gateway,
+        outboxService: outbox,
+        storeCreditLedger: custSvc,
+        pgPool: pg,
+      });
+      const rmaWf = buildProcessReturnRefundWorkflow({
+        inventoryService: inv,
+        paymentGateway: gateway,
+        outboxService: outbox,
+        storeCreditLedger: custSvc,
+        pgPool: pg,
+      });
+
+      const chkRes = await checkoutWf.execute(
+        {
+          checkoutId: "chk-ledger-01",
+          channelSlug: "us-retail",
+          customerId: "cust-ledger-1",
+          stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+          allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+          storeCreditToRedeem: 2_000n,
+          paymentToken: "tok_stripe_live",
+          cart: {
+            currencyCode: "USD",
+            taxMode: "TAX_EXCLUSIVE",
+            shippingBaseAmount: 1_000n,
+            shippingTaxRateBps: 1_000, // 10%
+            lines: [
+              {
+                lineId: "L-KB",
+                variantId: "SKU-TI-KB",
+                quantity: 2,
+                baseUnitPrice: 10_000n, // $200.00 subtotal + $20 tax = $220; + $11 shipping = $231.00 (23_100)
+                taxRateBps: 1_000,
+              },
+            ],
+          },
+        },
+        { idempotencyKey: "idem-chk-ledger-01", store: wfStore }
+      );
+      assert.equal(chkRes.status, "COMPLETED");
+
+      // Return 1 of 2 keyboards with a 10% restocking fee (1000 bps)
+      const rmaRes = await rmaWf.execute(
+        {
+          rmaId: "rma-ledger-01",
+          orderId: "ord_chk-ledger-01",
+          linesToReturn: [{ lineId: "L-KB", quantity: 1, restockingFeeBps: 1_000 }],
+        },
+        { idempotencyKey: "idem-rma-ledger-01", store: wfStore }
+      );
+      assert.equal(rmaRes.status, "COMPLETED");
+
+      // Verify normalized order_lines analytics
+      const ordersRepo = new PgOrdersRepository(pg);
+      const skuStats = await ordersRepo.getSkuRevenueAnalytics({ channelSlug: "us-retail" });
+      assert.equal(skuStats.length, 1);
+      assert.equal(skuStats[0]?.variantId, "SKU-TI-KB");
+      assert.equal(skuStats[0]?.unitsSold, 2);
+      assert.equal(skuStats[0]?.totalNetAmount, 20_000n);
+      assert.equal(skuStats[0]?.totalTaxAmount, 2_000n);
+      assert.equal(skuStats[0]?.totalGrossAmount, 22_000n);
+
+      // Verify Double-Entry Subledger Trial Balance is 100% balanced (Debits === Credits)
+      const subledger = new PgDoubleEntryLedgerService(pg);
+      const trialBalance = await subledger.getTrialBalance("USD");
+      assert.equal(trialBalance.isBalanced, true);
+      assert.ok(trialBalance.grandTotalDebits > 0n);
+      assert.equal(trialBalance.grandTotalDebits, trialBalance.grandTotalCredits);
+
+      // Unbalanced manual posting must be rejected by UnbalancedJournalError
+      await assert.rejects(
+        () =>
+          subledger.recordJournalEntry({
+            idempotencyKey: "bad-journal-1",
+            referenceType: "MANUAL_ADJUSTMENT",
+            referenceId: "adj-1",
+            channelSlug: "us-retail",
+            currencyCode: "USD",
+            postings: [
+              { accountCode: "CASH_GATEWAY_CLEARING", direction: "DEBIT", amount: 500n },
+              { accountCode: "MERCHANT_SALES_REVENUE", direction: "CREDIT", amount: 499n },
+            ],
+          }),
+        UnbalancedJournalError
+      );
     } finally {
       await pg.close();
     }

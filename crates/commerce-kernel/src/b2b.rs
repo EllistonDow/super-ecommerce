@@ -262,6 +262,8 @@ mod tests {
                 tax_rate_bps: 825, // 8.25%
                 is_gift: false,
                 candidate_line_discounts: vec![],
+                unit_cost_amount: None,
+                min_margin_bps: 0,
             }],
             candidate_order_discounts: vec![],
             shipping_base_amount: 0,

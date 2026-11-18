@@ -195,6 +195,60 @@ function hydrateOrderRow(
   };
 }
 
+export interface SkuRevenueAnalyticsRow {
+  readonly variantId: string;
+  readonly channelSlug: string;
+  readonly currencyCode: string;
+  readonly lineCount: number;
+  readonly unitsSold: number;
+  readonly totalDiscountAmount: bigint;
+  readonly totalNetAmount: bigint;
+  readonly totalTaxAmount: bigint;
+  readonly totalGrossAmount: bigint;
+}
+
+export async function persistNormalizedOrderLines(
+  order: OrderRecord,
+  runner: PgQueryable
+): Promise<void> {
+  for (const line of order.pricing.lines) {
+    const rowId = `ol_${order.orderId}_${line.lineId}`;
+    await runner.query(
+      `INSERT INTO order_lines (
+         id, order_id, line_id, variant_id, channel_slug, currency_code,
+         quantity, is_gift, effective_unit_price, line_discount_amount,
+         allocated_order_discount_amount, net_amount, tax_amount, gross_amount, created_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6,
+         $7, $8, $9, $10,
+         $11, $12, $13, $14, $15::timestamptz
+       )
+       ON CONFLICT (order_id, line_id) DO UPDATE SET
+         quantity = excluded.quantity,
+         net_amount = excluded.net_amount,
+         tax_amount = excluded.tax_amount,
+         gross_amount = excluded.gross_amount`,
+      [
+        rowId,
+        order.orderId,
+        line.lineId,
+        line.variantId,
+        order.channelSlug,
+        order.currencyCode,
+        line.quantity,
+        line.isGift,
+        line.effectiveBaseUnitPrice.toString(),
+        line.lineLevelDiscountAmount.toString(),
+        line.allocatedOrderDiscountAmount.toString(),
+        line.totalNetAmount.toString(),
+        line.totalTaxAmount.toString(),
+        line.totalGrossAmount.toString(),
+        order.createdAt,
+      ]
+    );
+  }
+}
+
 export class PgOrdersRepository {
   private readonly pool: PgPoolLike;
 
@@ -258,6 +312,78 @@ export class PgOrdersRepository {
         options?.cancelReason ?? null,
         order.createdAt,
       ]
+    );
+
+    await persistNormalizedOrderLines(order, this.runner(tx));
+  }
+
+  async getSkuRevenueAnalytics(options?: {
+    readonly channelSlug?: string;
+  }): Promise<readonly SkuRevenueAnalyticsRow[]> {
+    const hasChannel = Boolean(options?.channelSlug && options.channelSlug !== "ALL");
+    const whereSql = hasChannel ? "WHERE channel_slug = $1" : "";
+    const params = hasChannel ? [options!.channelSlug!] : [];
+
+    const res = await this.pool.query<{
+      variant_id: string;
+      channel_slug: string;
+      currency_code: string;
+      quantity: string;
+      line_discount_amount: string;
+      allocated_order_discount_amount: string;
+      net_amount: string;
+      tax_amount: string;
+      gross_amount: string;
+    }>(
+      `SELECT variant_id, channel_slug, currency_code, quantity,
+              line_discount_amount, allocated_order_discount_amount,
+              net_amount, tax_amount, gross_amount
+       FROM order_lines
+       ${whereSql}`,
+      params
+    );
+
+    const groups = new Map<string, {
+      variantId: string;
+      channelSlug: string;
+      currencyCode: string;
+      lineCount: number;
+      unitsSold: number;
+      totalDiscountAmount: bigint;
+      totalNetAmount: bigint;
+      totalTaxAmount: bigint;
+      totalGrossAmount: bigint;
+    }>();
+
+    for (const r of res.rows) {
+      const key = `${r.channel_slug}::${r.currency_code}::${r.variant_id}`;
+      const g = groups.get(key) ?? {
+        variantId: r.variant_id,
+        channelSlug: r.channel_slug,
+        currencyCode: r.currency_code,
+        lineCount: 0,
+        unitsSold: 0,
+        totalDiscountAmount: 0n,
+        totalNetAmount: 0n,
+        totalTaxAmount: 0n,
+        totalGrossAmount: 0n,
+      };
+      g.lineCount += 1;
+      g.unitsSold += Number(r.quantity);
+      g.totalDiscountAmount +=
+        BigInt(r.line_discount_amount) + BigInt(r.allocated_order_discount_amount);
+      g.totalNetAmount += BigInt(r.net_amount);
+      g.totalTaxAmount += BigInt(r.tax_amount);
+      g.totalGrossAmount += BigInt(r.gross_amount);
+      groups.set(key, g);
+    }
+
+    return [...groups.values()].sort((a, b) =>
+      b.totalGrossAmount !== a.totalGrossAmount
+        ? b.totalGrossAmount > a.totalGrossAmount
+          ? 1
+          : -1
+        : a.variantId.localeCompare(b.variantId)
     );
   }
 

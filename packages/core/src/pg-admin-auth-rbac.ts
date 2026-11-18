@@ -11,7 +11,7 @@
  *   and authorization attempt (both ALLOW and 401/403 DENY decisions).
  */
 
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import type { PgPoolLike, PgTxClient } from "@super-ecommerce/db";
 import {
   type AdminPermission,
@@ -19,8 +19,11 @@ import {
   type AdminRole,
   type AdminSessionClaims,
   type AdminRbacAuditEntry,
+  constantTimeHexEqual,
+  hashAdminPasswordScrypt,
   ROLE_PERMISSION_MATRIX,
   SEEDED_ADMIN_ACCOUNTS,
+  verifyAdminPasswordConstantTime,
 } from "./admin-auth-rbac.ts";
 
 export interface AdminRoleRecord {
@@ -73,19 +76,15 @@ export interface AdminAuditLogRecord {
   readonly createdAt: string;
 }
 
-const PASSWORD_PEPPER = "kronos_super_ecommerce_pwd_pepper_2026";
-
-function hashPasswordHex(email: string, password: string): string {
-  return createHmac("sha256", PASSWORD_PEPPER)
-    .update(`${email.toLowerCase().trim()}:${password}`)
-    .digest("hex");
-}
-
-function constantTimeHexEqual(aHex: string, bHex: string): boolean {
-  if (aHex.length !== bHex.length) return false;
-  const bufA = Buffer.from(aHex, "utf8");
-  const bufB = Buffer.from(bHex, "utf8");
-  return timingSafeEqual(bufA, bufB);
+let cachedPgDummyScrypt: string | null = null;
+function getDummyPgScryptFallback(): string {
+  if (!cachedPgDummyScrypt) {
+    cachedPgDummyScrypt = hashAdminPasswordScrypt(
+      "pg_dummy_constant_time_fallback",
+      Buffer.from("fedcba9876543210fedcba9876543210", "hex")
+    );
+  }
+  return cachedPgDummyScrypt;
 }
 
 export class PgAdminAuthRbacService {
@@ -305,7 +304,7 @@ export class PgAdminAuthRbacService {
   ): Promise<AdminUserRecord> {
     const adminId = input.adminId ?? `adm_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const email = input.email.toLowerCase().trim();
-    const passwordHash = hashPasswordHex(email, input.passwordPlain);
+    const passwordHash = hashAdminPasswordScrypt(input.passwordPlain);
     const nowIso = new Date().toISOString();
 
     return await this.runInTx(tx, async (q) => {
@@ -431,15 +430,25 @@ export class PgAdminAuthRbacService {
         [normalizedEmail]
       );
 
-      const candidateHex = hashPasswordHex(normalizedEmail, passwordPlain);
-      const targetHex =
-        userRes.rows[0]?.password_hash ??
-        hashPasswordHex("invalid@kronos.io", "dummy_constant_time_fallback");
+      const targetHash = userRes.rows[0]?.password_hash ?? getDummyPgScryptFallback();
+      const verification = verifyAdminPasswordConstantTime(
+        normalizedEmail,
+        passwordPlain,
+        targetHash
+      );
 
       const matched =
         userRes.rows.length > 0 &&
         Boolean(userRes.rows[0]!.is_active) &&
-        constantTimeHexEqual(candidateHex, targetHex);
+        verification.valid;
+
+      if (matched && verification.needsRehash && userRes.rows[0]) {
+        const upgradedScryptHash = hashAdminPasswordScrypt(passwordPlain);
+        await q.query(
+          `UPDATE admin_users SET password_hash = $1, updated_at = $2::timestamptz WHERE admin_id = $3`,
+          [upgradedScryptHash, new Date().toISOString(), userRes.rows[0].admin_id]
+        );
+      }
 
       if (!matched || userRes.rows.length === 0) {
         const audit = await this.recordAudit(

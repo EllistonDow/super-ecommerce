@@ -155,4 +155,61 @@ describe("@super-ecommerce/mcp-server", () => {
     assert.equal(rrfReport.hits[0]?.rrfScore > 0, true);
     assert.match(mcp.listInvocationLogs()[0]?.headlineFinding ?? "", /HYBRID RRF SEARCH/);
   });
+
+  it("handles standard MCP JSON-RPC 2.0 initialize, notifications, tools/list with JSON Schema, and tools/call", async () => {
+    const mcp = new SuperCommerceMcpServer([
+      {
+        channelSlug: "us-retail",
+        productId: "p-1",
+        productSlug: "cnc-dac",
+        productName: "CNC Desktop DAC",
+        currencyCode: "USD",
+        minEffectivePrice: 59_000n,
+        maxEffectivePrice: 59_000n,
+        isInStock: true,
+        totalAvailableQty: 5,
+        mergedAttributes: { chassis: ["cnc-aluminum"] },
+        variantsSnapshot: [],
+      },
+    ]);
+
+    const initRes = await mcp.handleJsonRpcMessage({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-03-26" },
+    });
+    assert.equal(initRes?.id, 1);
+    assert.equal((initRes?.result as { protocolVersion: string }).protocolVersion, "2025-03-26");
+
+    // Notification returns null (no response frame)
+    const notifRes = await mcp.handleJsonRpcMessage({
+      jsonrpc: "2.0",
+      method: "notifications/initialized",
+    });
+    assert.equal(notifRes, null);
+
+    const listRes = await mcp.handleJsonRpcMessage({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/list",
+    });
+    const tools = (listRes?.result as { tools: { name: string; inputSchema: Record<string, unknown> }[] }).tools;
+    assert.equal(tools.length, 4);
+    assert.equal(tools[0]?.inputSchema["type"], "object");
+
+    const callRes = await mcp.handleJsonRpcMessage({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "search_catalog_hybrid",
+        arguments: { channelSlug: "us-retail", queryText: "aluminum dac" },
+      },
+    });
+    const callPayload = callRes?.result as { isError: boolean; content: { type: string; text: string }[] };
+    assert.equal(callPayload.isError, false);
+    const decoded = JSON.parse(callPayload.content[0]!.text) as { totalReturned: number };
+    assert.equal(decoded.totalReturned, 1);
+  });
 });

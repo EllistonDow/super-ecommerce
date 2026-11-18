@@ -10,6 +10,7 @@
  *   strict execution budget enforcement, and high-concurrency stress telemetry.
  */
 
+import { Worker } from "node:worker_threads";
 import type { MinorUnits } from "@super-ecommerce/kernel";
 
 export interface ShippingMethodOption {
@@ -78,7 +79,10 @@ export type BuiltinWasmModuleKind =
   | "TRAP_DIV_ZERO"
   | "TRAP_OOB_MEMORY"
   | "CPU_SPIN_LOOP"
+  | "INFINITE_LOOP"
   | "MALICIOUS_HOST_IMPORT";
+
+export type PluginFailurePolicy = "FAIL_OPEN" | "FAIL_CLOSED";
 
 /**
  * Generates deterministic, valid WebAssembly binary modules (`.wasm`) for production
@@ -168,6 +172,16 @@ export function buildShippingSurchargeWasm(kind: BuiltinWasmModuleKind): Uint8Ar
         0x0d, 0x00,       // br_if 0
         0x0b,             // end loop
         0x42, 0xb0, 0x09, // i64.const 1200
+        0x0b,             // end func
+      ];
+      break;
+    case "INFINITE_LOOP":
+      // True non-terminating loop (`loop (result i64) -> br 0 -> end`) that hangs any synchronous V8 isolate forever
+      codeSection = [
+        0x0a, 0x09, 0x01, 0x07, 0x00,
+        0x03, 0x7e,       // loop (result i64)
+        0x0c, 0x00,       // br 0 (unconditional infinite jump)
+        0x0b,             // end loop
         0x0b,             // end func
       ];
       break;
@@ -372,6 +386,201 @@ export class WasmPluginSandboxHost {
         error: errorMessage,
         output: params.fallbackSurcharge,
       };
+    }
+  }
+
+  private standbyWorker: Worker | null = null;
+
+  private ensureStandbyWorker(): Worker {
+    if (this.standbyWorker) {
+      return this.standbyWorker;
+    }
+    const workerScript = `
+      const { parentPort } = require("node:worker_threads");
+      const cache = new Map();
+      parentPort.on("message", async (msg) => {
+        try {
+          let mod = cache.get(msg.pluginId);
+          if (!mod) {
+            mod = await WebAssembly.compile(msg.wasmBytes);
+            cache.set(msg.pluginId, mod);
+          }
+          const instance = await WebAssembly.instantiate(mod, {});
+          const mem = instance.exports.memory;
+          const pages = mem instanceof WebAssembly.Memory ? Math.ceil(mem.buffer.byteLength / 65536) : 1;
+          if (pages > msg.maxMemoryPages) {
+            throw new Error("WASM memory limit exceeded: " + pages + " pages > " + msg.maxMemoryPages);
+          }
+          const fn = instance.exports.evaluate_shipping_surcharge;
+          if (typeof fn !== "function") {
+            throw new Error("Missing export evaluate_shipping_surcharge");
+          }
+          const raw = fn(BigInt(msg.subtotalStr), msg.weight, msg.isB2b);
+          const outBig = typeof raw === "bigint" ? raw : BigInt(Math.trunc(raw));
+          parentPort.postMessage({ ok: true, pages, outStr: (outBig >= 0n ? outBig : 0n).toString() });
+        } catch (err) {
+          parentPort.postMessage({ ok: false, error: err && err.message ? err.message : String(err) });
+        }
+      });
+    `;
+    const w = new Worker(workerScript, { eval: true });
+    w.unref();
+    this.standbyWorker = w;
+    return w;
+  }
+
+  /**
+   * Preemptive Worker-Isolated WASM Execution:
+   * Runs the `.wasm` module inside an isolated `node:worker_threads` V8 isolate with a hard
+   * wall-clock watchdog. If a rogue plugin enters an infinite loop (`loop; br 0`), `worker.terminate()`
+   * physically kills the worker isolate within `maxExecutionMs` without blocking the main event loop!
+   */
+  async executePreemptiveShippingSurchargeWasm(params: {
+    pluginId: string;
+    ctx: PluginEvaluationContext;
+    fallbackSurcharge: MinorUnits;
+    failurePolicy?: PluginFailurePolicy;
+  }): Promise<SandboxedExecutionResult<MinorUnits>> {
+    const policy = params.failurePolicy ?? "FAIL_OPEN";
+    const entry = this.compiledModules.get(params.pluginId);
+    if (!entry) {
+      if (policy === "FAIL_CLOSED") {
+        throw new Error(`FAIL_CLOSED: Unregistered WASM plugin '${params.pluginId}'`);
+      }
+      return {
+        pluginId: params.pluginId,
+        usedFallback: true,
+        faultKind: "UNREGISTERED_PLUGIN",
+        durationMs: 0,
+        durationUs: 0,
+        memoryPagesAllocated: 0,
+        error: `WASM plugin '${params.pluginId}' is not registered`,
+        output: params.fallbackSurcharge,
+      };
+    }
+
+    const t0 = process.hrtime.bigint();
+    if (entry.declaredImports.length > 0) {
+      const imp = entry.declaredImports[0]!;
+      const elapsedUs = Number(process.hrtime.bigint() - t0) / 1_000;
+      const errMsg = `ZERO_CAPABILITY_VIOLATION: Forbidden host import '${imp.module}.${imp.name}' (${imp.kind}) blocked by sandbox`;
+      if (policy === "FAIL_CLOSED") {
+        throw new Error(errMsg);
+      }
+      return {
+        pluginId: params.pluginId,
+        usedFallback: true,
+        faultKind: "ZERO_CAPABILITY_IMPORT_DENIED",
+        durationMs: elapsedUs / 1_000,
+        durationUs: Math.round(elapsedUs * 100) / 100,
+        memoryPagesAllocated: 0,
+        error: errMsg,
+        output: params.fallbackSurcharge,
+      };
+    }
+
+    const budgetMs = Math.max(1, entry.manifest.maxExecutionMs ?? 25);
+    const maxMemoryPages = entry.manifest.maxMemoryPages ?? 16;
+    const worker = this.ensureStandbyWorker();
+
+    const outcome = await new Promise<
+      | { kind: "ok"; pages: number; out: MinorUnits }
+      | { kind: "trap"; error: string }
+      | { kind: "timeout" }
+    >((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.standbyWorker = null;
+        void worker.terminate().catch(() => {});
+        resolve({ kind: "timeout" });
+      }, budgetMs);
+      timer.unref?.();
+
+      const onMsg = (msg: { ok: boolean; pages?: number; outStr?: string; error?: string }) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (msg.ok) {
+          resolve({ kind: "ok", pages: msg.pages ?? 1, out: BigInt(msg.outStr ?? "0") });
+        } else {
+          resolve({ kind: "trap", error: msg.error ?? "Unknown WASM worker trap" });
+        }
+      };
+
+      const onErr = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.standbyWorker = null;
+        resolve({ kind: "trap", error: err.message });
+      };
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        worker.off("message", onMsg);
+        worker.off("error", onErr);
+      };
+
+      worker.on("message", onMsg);
+      worker.once("error", onErr);
+      worker.postMessage({
+        pluginId: params.pluginId,
+        wasmBytes: entry.manifest.wasmBytes,
+        maxMemoryPages,
+        subtotalStr: params.ctx.cartSubtotalAmount.toString(),
+        weight: params.ctx.totalWeightGrams,
+        isB2b: params.ctx.isB2bCustomer ? 1 : 0,
+      });
+    });
+
+    const elapsedUs = Number(process.hrtime.bigint() - t0) / 1_000;
+    const durationMs = elapsedUs / 1_000;
+
+    if (outcome.kind === "ok") {
+      return {
+        pluginId: params.pluginId,
+        usedFallback: false,
+        faultKind: "NONE",
+        durationMs,
+        durationUs: Math.round(elapsedUs * 100) / 100,
+        memoryPagesAllocated: outcome.pages,
+        output: outcome.out,
+      };
+    }
+
+    const errMsg =
+      outcome.kind === "timeout"
+        ? `PREEMPTIVE_WORKER_KILLED: WASM plugin '${params.pluginId}' exceeded ${budgetMs}ms wall budget and worker isolate was terminated`
+        : outcome.error;
+    const faultKind =
+      outcome.kind === "timeout"
+        ? "BUDGET_TIMEOUT_EXCEEDED"
+        : classifyWasmError(outcome.error);
+
+    if (policy === "FAIL_CLOSED") {
+      throw new Error(errMsg);
+    }
+
+    return {
+      pluginId: params.pluginId,
+      usedFallback: true,
+      faultKind,
+      durationMs,
+      durationUs: Math.round(elapsedUs * 100) / 100,
+      memoryPagesAllocated: 1,
+      error: errMsg,
+      output: params.fallbackSurcharge,
+    };
+  }
+
+  async close(): Promise<void> {
+    if (this.standbyWorker) {
+      const w = this.standbyWorker;
+      this.standbyWorker = null;
+      await w.terminate().catch(() => {});
     }
   }
 }

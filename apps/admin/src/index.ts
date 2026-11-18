@@ -128,7 +128,12 @@ export function renderAdminLoginHtml(options?: {
   readonly errorMessage?: string;
   readonly currentPrincipal?: AdminPrincipal;
   readonly nextPath?: string;
+  readonly showDemoCredentials?: boolean;
 }): string {
+  const showDemo =
+    options?.showDemoCredentials ??
+    (process.env["NODE_ENV"] !== "production" ||
+      process.env["SUPER_SHOW_DEMO_CREDENTIALS"] === "1");
   const safeNext = sanitizeSafeAdminNextPath(options?.nextPath);
   const nextTargetJson = JSON.stringify(safeNext)
     .replaceAll("<", "\\u003c")
@@ -136,14 +141,15 @@ export function renderAdminLoginHtml(options?: {
     .replaceAll("&", "\\u0026")
     .replaceAll(String.fromCharCode(0x2028), "\\u2028")
     .replaceAll(String.fromCharCode(0x2029), "\\u2029");
-  const accountCardsHtml = SEEDED_ADMIN_ACCOUNTS.map((acc) => {
-    const badgeColor =
-      acc.role === "SUPER_ADMIN"
-        ? "var(--accent-green)"
-        : acc.role === "MERCHANT_OPS"
-        ? "var(--accent-blue)"
-        : "var(--accent-amber)";
-    return `
+  const accountCardsHtml = showDemo
+    ? SEEDED_ADMIN_ACCOUNTS.map((acc) => {
+        const badgeColor =
+          acc.role === "SUPER_ADMIN"
+            ? "var(--accent-green)"
+            : acc.role === "MERCHANT_OPS"
+            ? "var(--accent-blue)"
+            : "var(--accent-amber)";
+        return `
       <div class="account-card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 8px;">
           <strong class="mono" style="color: ${badgeColor}; font-size: 12px;">${escapeHtml(acc.role)} (${acc.permissions.length}/7 PERMS)</strong>
@@ -158,7 +164,8 @@ export function renderAdminLoginHtml(options?: {
           ${escapeHtml(acc.displayName)} // ${escapeHtml(acc.scopeSummary)}
         </div>
       </div>`;
-  }).join("");
+      }).join("")
+    : `<div class="account-card"><div class="mono" style="font-size: 11px; color: var(--text-dim);">Production mode active: demo credential quick-fill is disabled. Sign in with provisioned RBAC credentials.</div></div>`;
 
   return `<!DOCTYPE html>
 <html lang="en" data-theme="dark">

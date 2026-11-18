@@ -34,6 +34,7 @@ import {
   type ReturnItemCondition,
 } from "./inventory-service.ts";
 import { type OutboxStoreLike } from "./outbox-service.ts";
+import { PgDoubleEntryLedgerService } from "./double-entry-ledger.ts";
 import type {
   OrderRecord,
   PaymentGatewayStrategy,
@@ -424,6 +425,7 @@ export function buildProcessReturnRefundWorkflow(deps: RmaWorkflowDeps) {
       };
 
       if (deps.pgPool) {
+        const subledger = new PgDoubleEntryLedgerService(deps.pgPool);
         await deps.pgPool.withTransaction(async (tx) => {
           await tx.query(
             `UPDATE orders
@@ -458,6 +460,7 @@ export function buildProcessReturnRefundWorkflow(deps: RmaWorkflowDeps) {
             ]
           );
 
+          await subledger.recordRmaRefundJournal(rmaRecord, tx);
           await deps.outboxService.enqueue(outboxEventParams, tx);
         });
 

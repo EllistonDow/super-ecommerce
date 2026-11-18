@@ -23,12 +23,17 @@ import {
   type CatalogChannelProjectionRecord,
   type PgPoolLike,
 } from "@super-ecommerce/db";
-import { PgWorkflowStateStore } from "@super-ecommerce/workflow";
+import {
+  PgWorkflowStateStore,
+  SagaRecoveryWorker,
+  WorkflowConcurrentExecutionError,
+} from "@super-ecommerce/workflow";
 import {
   buildCompleteCheckoutWorkflow,
   buildProcessReturnRefundWorkflow,
   InvalidOrderCursorError,
   PgB2bOrganizationService,
+  PgDoubleEntryLedgerService,
   PgMsiInventoryService,
   PgOrdersRepository,
   PgReservationTtlReaperService,
@@ -46,6 +51,7 @@ import {
 import {
   SuperCommerceMcpServer,
   type CatalogHybridSearchQuery,
+  type McpJsonRpcRequest,
 } from "@super-ecommerce/mcp-server";
 
 export interface SuperCommerceGatewayOptions {
@@ -153,6 +159,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
   const outboxService = new PgTransactionalOutboxService(pgPool);
   const workflowStore = new PgWorkflowStateStore(pgPool);
   const ordersRepo = new PgOrdersRepository(pgPool);
+  const subledger = new PgDoubleEntryLedgerService(pgPool);
   const mcpServer = new SuperCommerceMcpServer(projections);
   const maxGraphQlDepth = options.maxGraphQlDepth ?? 8;
   const maxGraphQlAliases = options.maxGraphQlAliases ?? 8;
@@ -195,6 +202,11 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
     inventoryService,
     b2bService,
     outboxService,
+  });
+
+  const sagaRecoveryWorker = new SagaRecoveryWorker({
+    store: workflowStore,
+    workflows: [checkoutWorkflow, rmaWorkflow],
   });
 
   const stripeWebhookService = new PgStripeWebhookService({
@@ -253,6 +265,22 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
       get: async (params: { readonly orderId: string }) => {
         if (!isReady) await ensureReady();
         return ordersRepo.getOrder(params.orderId);
+      },
+      analyticsBySku: async (params?: { readonly channelSlug?: string }) => {
+        if (!isReady) await ensureReady();
+        return ordersRepo.getSkuRevenueAnalytics(params);
+      },
+    },
+    ledger: {
+      getTrialBalance: async (params?: { readonly currencyCode?: string }) => {
+        if (!isReady) await ensureReady();
+        return subledger.getTrialBalance(params?.currencyCode ?? "USD");
+      },
+    },
+    workflow: {
+      recoverOrphans: async (params?: { readonly nowMs?: number; readonly limit?: number }) => {
+        if (!isReady) await ensureReady();
+        return sagaRecoveryWorker.recoverOrphanedRuns(params);
       },
     },
     inventory: {
@@ -338,13 +366,76 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
     if (!isReady) await ensureReady();
     const url = new URL(req.url);
 
-    if (req.method === "GET" && url.pathname === "/health") {
+    if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
+      let pgVersion: string | null = null;
+      try {
+        const verRes = await pgPool.query<{ server_version: string }>(
+          "SELECT current_setting('server_version') AS server_version"
+        );
+        pgVersion = verRes.rows[0]?.server_version ?? null;
+      } catch {
+        pgVersion = null;
+      }
       return jsonResponse({
         status: "ok",
+        version: "0.2.0",
         engine: "super-ecommerce",
+        database: "postgres",
         storage: "postgresql",
-        protocols: ["orpc", "graphql", "mcp", "stripe-webhooks"],
+        pgVersion,
+        protocols: ["orpc", "openapi-3.1", "mcp", "graphql", "stripe-webhooks"],
+        timestamp: new Date().toISOString(),
       });
+    }
+
+    // OpenAPI 3.1.0 Contract Endpoint: GET /openapi.json
+    if (req.method === "GET" && url.pathname === "/openapi.json") {
+      return jsonResponse({
+        openapi: "3.1.0",
+        info: {
+          title: "Super Ecommerce Headless Commerce Gateway API",
+          version: "0.2.0",
+          description:
+            "Zero-float deterministic commerce API powered by Rust commerce-kernel, PostgreSQL 17 Durable Sagas, Double-Entry Subledger, and Model Context Protocol (MCP).",
+        },
+        paths: {
+          "/healthz": { get: { summary: "Database & kernel readiness probe" } },
+          "/mcp": { post: { summary: "Streamable HTTP Model Context Protocol (JSON-RPC 2.0)" } },
+          "/webhooks/stripe": { post: { summary: "HMAC-SHA256 verified Stripe Webhook receiver" } },
+          "/rpc/catalog.search": { post: { summary: "0-JOIN CQRS projection search" } },
+          "/rpc/catalog.hybridSearch": { post: { summary: "BM25 + Vector RRF hybrid search" } },
+          "/rpc/pricing.calculate": { post: { summary: "Two-pass Hare-Niemeyer + Margin Floor Guard pricing" } },
+          "/rpc/checkout.complete": { post: { summary: "5-step Durable Saga checkout with mutual-exclusion lease" } },
+          "/rpc/rma.processReturn": { post: { summary: "Multi-wave partial RMA return & refund Saga" } },
+          "/rpc/orders.list": { post: { summary: "Keyset-paginated orders query" } },
+          "/rpc/orders.get": { post: { summary: "Hydrated order & returns lookup" } },
+          "/rpc/orders.analyticsBySku": { post: { summary: "Normalized order_lines SKU revenue & tax aggregation" } },
+          "/rpc/ledger.getTrialBalance": { post: { summary: "Double-Entry Subledger trial balance verification" } },
+          "/rpc/workflow.recoverOrphans": { post: { summary: "Trigger SagaRecoveryWorker orphan scan" } },
+          "/rpc/b2b.submitPo": { post: { summary: "Enterprise B2B purchase order submission & 72h hold" } },
+        },
+      });
+    }
+
+    // Streamable HTTP Model Context Protocol Endpoint: POST /mcp
+    if (req.method === "POST" && url.pathname === "/mcp") {
+      try {
+        const rpcReq = (await req.json()) as McpJsonRpcRequest;
+        const rpcRes = await mcpServer.handleJsonRpcMessage(rpcReq);
+        if (rpcRes === null) {
+          return new Response(null, { status: 202 });
+        }
+        return jsonResponse(rpcRes, 200);
+      } catch {
+        return jsonResponse(
+          {
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32700, message: "Parse error" },
+          },
+          400
+        );
+      }
     }
 
     // 0. Cryptographic Stripe Webhook Endpoint: POST /webhooks/stripe
@@ -495,14 +586,70 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
           );
           return jsonResponse({ ok: true, data: diag });
         }
-        case "rma.processReturn": {
-          const rmaRes = await rpcClient.rma.processReturn(
-            body as unknown as {
-              idempotencyKey: string;
-              input: ProcessReturnRefundInput;
+        case "orders.analyticsBySku": {
+          const stats = await rpcClient.orders.analyticsBySku({
+            channelSlug:
+              typeof body["channelSlug"] === "string" ? body["channelSlug"] : undefined,
+          });
+          return jsonResponse({ ok: true, data: stats });
+        }
+        case "ledger.getTrialBalance": {
+          const tb = await rpcClient.ledger.getTrialBalance({
+            currencyCode:
+              typeof body["currencyCode"] === "string" ? body["currencyCode"] : undefined,
+          });
+          return jsonResponse({ ok: true, data: tb });
+        }
+        case "workflow.recoverOrphans": {
+          const rec = await rpcClient.workflow.recoverOrphans({
+            nowMs: typeof body["nowMs"] === "number" ? body["nowMs"] : undefined,
+            limit: typeof body["limit"] === "number" ? body["limit"] : undefined,
+          });
+          return jsonResponse({ ok: true, data: rec });
+        }
+        case "checkout.complete": {
+          try {
+            const chkRes = await rpcClient.checkout.complete(
+              body as unknown as {
+                idempotencyKey: string;
+                input: CompleteCheckoutInput;
+              }
+            );
+            return jsonResponse({ ok: true, data: chkRes });
+          } catch (err) {
+            if (err instanceof WorkflowConcurrentExecutionError) {
+              return jsonResponse(
+                { ok: false, code: "WORKFLOW_CONCURRENT_EXECUTION", error: err.message },
+                409
+              );
             }
-          );
-          return jsonResponse({ ok: true, data: rmaRes });
+            return jsonResponse(
+              { ok: false, error: err instanceof Error ? err.message : String(err) },
+              500
+            );
+          }
+        }
+        case "rma.processReturn": {
+          try {
+            const rmaRes = await rpcClient.rma.processReturn(
+              body as unknown as {
+                idempotencyKey: string;
+                input: ProcessReturnRefundInput;
+              }
+            );
+            return jsonResponse({ ok: true, data: rmaRes });
+          } catch (err) {
+            if (err instanceof WorkflowConcurrentExecutionError) {
+              return jsonResponse(
+                { ok: false, code: "WORKFLOW_CONCURRENT_EXECUTION", error: err.message },
+                409
+              );
+            }
+            return jsonResponse(
+              { ok: false, error: err instanceof Error ? err.message : String(err) },
+              500
+            );
+          }
         }
         case "b2b.listCompanies": {
           const companies = await rpcClient.b2b.listCompanies();
@@ -628,7 +775,9 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
     pgPool,
     rpcClient,
     ordersRepo,
+    subledger,
     workflowStore,
+    sagaRecoveryWorker,
     outboxService,
     stripeWebhookService,
     b2bService,

@@ -8,8 +8,11 @@
  *    `workflow_step_logs`. If a process restarts mid-flight and re-runs with the same
  *    `idempotencyKey`, already-completed steps return their persisted output without
  *    re-triggering external side effects (e.g. double-charging a credit card).
- * 2. Automatic Retries: Transient step failures retry with configurable backoff.
- * 3. Reverse-Order Saga Compensation: When a step fails permanently, all previously
+ * 2. Atomic Mutual-Exclusion Leases (`locked_by`, `lease_expires_at`): Prevents concurrent
+ *    duplicate `idempotencyKey` requests from racing and double-executing side-effect steps.
+ * 3. Autonomous Zombie Run Recovery (`SagaRecoveryWorker`): Scans orphaned `RUNNING` /
+ *    `COMPENSATING` runs whose lease has expired and drives them to completion or LIFO rollback.
+ * 4. Reverse-Order Saga Compensation: When a step fails permanently, all previously
  *    completed steps in the run are compensated in strict LIFO (reverse) order.
  */
 
@@ -28,6 +31,32 @@ export type WorkflowRunStatus =
   | "FAILED";
 
 export type WorkflowStepStatus = "COMPLETED" | "COMPENSATED" | "FAILED";
+
+export class WorkflowConcurrentExecutionError extends Error {
+  readonly idempotencyKey: string;
+  readonly runId: string;
+
+  constructor(params: { idempotencyKey: string; runId: string }) {
+    super(
+      `Workflow run '${params.runId}' (idempotencyKey='${params.idempotencyKey}') is already actively leased by another execution`
+    );
+    this.name = "WorkflowConcurrentExecutionError";
+    this.idempotencyKey = params.idempotencyKey;
+    this.runId = params.runId;
+  }
+}
+
+/**
+ * Sentinel error for chaos/crash testing: simulates an abrupt OS `SIGKILL` / container crash
+ * mid-workflow (terminates execution immediately WITHOUT releasing the lease or running
+ * in-process compensation, leaving recovery to `SagaRecoveryWorker` once the lease expires).
+ */
+export class ProcessCrashSimulatedError extends Error {
+  constructor(message = "SIMULATED_PROCESS_CRASH_SIGKILL") {
+    super(message);
+    this.name = "ProcessCrashSimulatedError";
+  }
+}
 
 export interface PersistedStepLog<TOutput = unknown> {
   readonly stepName: string;
@@ -63,16 +92,33 @@ export interface PersistedWorkflowRunSummary {
   readonly compensatedLifoChain: readonly string[];
 }
 
-/**
- * Storage adapter interface so the engine runs identically against PostgreSQL 17
- * (`workflow_runs` + `workflow_step_logs`) or an in-memory store in unit tests.
- */
+export interface OrphanedWorkflowCandidate {
+  readonly id: string;
+  readonly workflowName: string;
+  readonly idempotencyKey: string;
+  readonly status: WorkflowRunStatus;
+  readonly inputPayload: unknown;
+  readonly attemptCount: number;
+}
+
 export interface WorkflowStateStore {
   getOrCreateRun<TInput>(params: {
     workflowName: string;
     idempotencyKey: string;
     input: TInput;
   }): Promise<PersistedWorkflowRun<TInput>>;
+
+  tryAcquireRunLease?(params: {
+    runId: string;
+    workerId: string;
+    leaseDurationMs: number;
+    nowMs?: number;
+  }): Promise<boolean>;
+
+  listExpiredOrphanRuns?(params?: {
+    nowMs?: number;
+    limit?: number;
+  }): Promise<readonly OrphanedWorkflowCandidate[]>;
 
   recordStepSuccess<TOutput>(params: {
     runId: string;
@@ -91,6 +137,7 @@ export interface WorkflowStateStore {
     status: WorkflowRunStatus;
     output?: TOutput;
     errorMessage?: string;
+    clearLease?: boolean;
   }): Promise<void>;
 }
 
@@ -98,27 +145,39 @@ export interface WorkflowStateStore {
  * Default deterministic in-memory store (also serves as reference for the PG adapter).
  */
 export class InMemoryWorkflowStateStore implements WorkflowStateStore {
-  private readonly runsByKey = new Map<string, {
-    id: string;
-    workflowName: string;
-    idempotencyKey: string;
-    status: WorkflowRunStatus;
-    inputPayload: unknown;
-    outputPayload?: unknown;
-    errorMessage?: string;
-    steps: Map<string, PersistedStepLog>;
-  }>();
+  private readonly runsByKey = new Map<
+    string,
+    {
+      id: string;
+      workflowName: string;
+      idempotencyKey: string;
+      status: WorkflowRunStatus;
+      inputPayload: unknown;
+      outputPayload?: unknown;
+      errorMessage?: string;
+      lockedBy: string | null;
+      leaseExpiresAtMs: number | null;
+      attemptCount: number;
+      steps: Map<string, PersistedStepLog>;
+    }
+  >();
 
-  private readonly runsById = new Map<string, {
-    id: string;
-    workflowName: string;
-    idempotencyKey: string;
-    status: WorkflowRunStatus;
-    inputPayload: unknown;
-    outputPayload?: unknown;
-    errorMessage?: string;
-    steps: Map<string, PersistedStepLog>;
-  }>();
+  private readonly runsById = new Map<
+    string,
+    {
+      id: string;
+      workflowName: string;
+      idempotencyKey: string;
+      status: WorkflowRunStatus;
+      inputPayload: unknown;
+      outputPayload?: unknown;
+      errorMessage?: string;
+      lockedBy: string | null;
+      leaseExpiresAtMs: number | null;
+      attemptCount: number;
+      steps: Map<string, PersistedStepLog>;
+    }
+  >();
 
   private nextId = 1;
 
@@ -130,7 +189,13 @@ export class InMemoryWorkflowStateStore implements WorkflowStateStore {
     const existing = this.runsByKey.get(params.idempotencyKey);
     if (existing) {
       return {
-        ...(existing as PersistedWorkflowRun<TInput>),
+        id: existing.id,
+        workflowName: existing.workflowName,
+        idempotencyKey: existing.idempotencyKey,
+        status: existing.status,
+        inputPayload: existing.inputPayload as TInput,
+        outputPayload: existing.outputPayload,
+        errorMessage: existing.errorMessage,
         steps: new Map(existing.steps),
       };
     }
@@ -142,15 +207,66 @@ export class InMemoryWorkflowStateStore implements WorkflowStateStore {
       idempotencyKey: params.idempotencyKey,
       status: "RUNNING" as WorkflowRunStatus,
       inputPayload: params.input,
+      lockedBy: null,
+      leaseExpiresAtMs: null,
+      attemptCount: 0,
       steps: new Map<string, PersistedStepLog>(),
     };
     this.runsByKey.set(params.idempotencyKey, record);
     this.runsById.set(id, record);
 
     return {
-      ...record,
+      id: record.id,
+      workflowName: record.workflowName,
+      idempotencyKey: record.idempotencyKey,
+      status: record.status,
+      inputPayload: record.inputPayload as TInput,
       steps: new Map(record.steps),
     };
+  }
+
+  async tryAcquireRunLease(params: {
+    runId: string;
+    workerId: string;
+    leaseDurationMs: number;
+    nowMs?: number;
+  }): Promise<boolean> {
+    const run = this.runsById.get(params.runId);
+    if (!run || run.status === "COMPLETED") return false;
+    const now = params.nowMs ?? Date.now();
+    if (run.lockedBy !== null && run.leaseExpiresAtMs !== null && run.leaseExpiresAtMs > now) {
+      return false;
+    }
+    run.lockedBy = params.workerId;
+    run.leaseExpiresAtMs = now + Math.max(1, params.leaseDurationMs);
+    run.attemptCount += 1;
+    run.status = "RUNNING";
+    return true;
+  }
+
+  async listExpiredOrphanRuns(params?: {
+    nowMs?: number;
+    limit?: number;
+  }): Promise<readonly OrphanedWorkflowCandidate[]> {
+    const now = params?.nowMs ?? Date.now();
+    const limit = Math.max(1, params?.limit ?? 50);
+    const out: OrphanedWorkflowCandidate[] = [];
+    for (const run of this.runsById.values()) {
+      if (run.status !== "RUNNING" && run.status !== "COMPENSATING") continue;
+      if (run.lockedBy !== null && run.leaseExpiresAtMs !== null && run.leaseExpiresAtMs > now) {
+        continue;
+      }
+      out.push({
+        id: run.id,
+        workflowName: run.workflowName,
+        idempotencyKey: run.idempotencyKey,
+        status: run.status,
+        inputPayload: run.inputPayload,
+        attemptCount: run.attemptCount,
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   async recordStepSuccess<TOutput>(params: {
@@ -189,6 +305,7 @@ export class InMemoryWorkflowStateStore implements WorkflowStateStore {
     status: WorkflowRunStatus;
     output?: TOutput;
     errorMessage?: string;
+    clearLease?: boolean;
   }): Promise<void> {
     const run = this.runsById.get(params.runId);
     if (!run) throw new Error(`Workflow run '${params.runId}' not found`);
@@ -199,13 +316,17 @@ export class InMemoryWorkflowStateStore implements WorkflowStateStore {
     if (params.errorMessage !== undefined) {
       run.errorMessage = params.errorMessage;
     }
+    if (params.clearLease || params.status === "COMPLETED" || params.status === "COMPENSATED") {
+      run.lockedBy = null;
+      run.leaseExpiresAtMs = null;
+    }
   }
 }
 
 /**
  * PostgreSQL 17-backed `WorkflowStateStore` (`workflow_runs` + `workflow_step_logs`).
- * Persists every workflow run and step output across concurrent processes with
- * lossless `BigInt` (`MinorUnits`) JSONB serialization and atomic idempotency.
+ * Persists every workflow run, mutual-exclusion lease, and step output across concurrent
+ * processes with lossless `BigInt` (`MinorUnits`) JSONB serialization.
  */
 export class PgWorkflowStateStore implements WorkflowStateStore {
   private readonly pool: PgPoolLike;
@@ -254,6 +375,12 @@ export class PgWorkflowStateStore implements WorkflowStateStore {
       };
     }
 
+    return await this.loadExistingRunByKey<TInput>(params.idempotencyKey);
+  }
+
+  private async loadExistingRunByKey<TInput>(
+    idempotencyKey: string
+  ): Promise<PersistedWorkflowRun<TInput>> {
     const existingRes = await this.pool.query<{
       id: string;
       workflow_name: string;
@@ -266,12 +393,12 @@ export class PgWorkflowStateStore implements WorkflowStateStore {
       `SELECT id, workflow_name, idempotency_key, status, input_payload, output_payload, error_message
        FROM workflow_runs
        WHERE idempotency_key = $1`,
-      [params.idempotencyKey]
+      [idempotencyKey]
     );
     const existingRow = existingRes.rows[0];
     if (!existingRow) {
       throw new Error(
-        `Workflow run with idempotency_key '${params.idempotencyKey}' disappeared concurrently`
+        `Workflow run with idempotency_key '${idempotencyKey}' disappeared concurrently`
       );
     }
 
@@ -317,6 +444,67 @@ export class PgWorkflowStateStore implements WorkflowStateStore {
     };
   }
 
+  async tryAcquireRunLease(params: {
+    runId: string;
+    workerId: string;
+    leaseDurationMs: number;
+    nowMs?: number;
+  }): Promise<boolean> {
+    const now = params.nowMs ?? Date.now();
+    const nowIso = new Date(now).toISOString();
+    const expiresIso = new Date(now + Math.max(1, params.leaseDurationMs)).toISOString();
+
+    const updated = await this.pool.query<{ id: string }>(
+      `UPDATE workflow_runs
+       SET locked_by = $1,
+           lease_expires_at = $2::timestamptz,
+           attempt_count = attempt_count + 1,
+           status = 'RUNNING',
+           updated_at = $3::timestamptz
+       WHERE id = $4::uuid
+         AND status != 'COMPLETED'
+         AND (locked_by IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= $3::timestamptz)
+       RETURNING id`,
+      [params.workerId, expiresIso, nowIso, params.runId]
+    );
+
+    return updated.rows.length > 0;
+  }
+
+  async listExpiredOrphanRuns(params?: {
+    nowMs?: number;
+    limit?: number;
+  }): Promise<readonly OrphanedWorkflowCandidate[]> {
+    const nowIso = new Date(params?.nowMs ?? Date.now()).toISOString();
+    const safeLimit = Math.max(1, Math.min(200, Math.trunc(params?.limit ?? 50)));
+
+    const res = await this.pool.query<{
+      id: string;
+      workflow_name: string;
+      idempotency_key: string;
+      status: WorkflowRunStatus;
+      input_payload: string;
+      attempt_count: string;
+    }>(
+      `SELECT id, workflow_name, idempotency_key, status, input_payload, attempt_count
+       FROM workflow_runs
+       WHERE status IN ('RUNNING', 'COMPENSATING')
+         AND (locked_by IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= $1::timestamptz)
+       ORDER BY updated_at ASC
+       LIMIT $2`,
+      [nowIso, safeLimit]
+    );
+
+    return res.rows.map((r) => ({
+      id: r.id,
+      workflowName: r.workflow_name,
+      idempotencyKey: r.idempotency_key,
+      status: r.status,
+      inputPayload: deserializeWithBigInt(r.input_payload),
+      attemptCount: Number(r.attempt_count ?? "0"),
+    }));
+  }
+
   async recordStepSuccess<TOutput>(params: {
     runId: string;
     stepName: string;
@@ -353,24 +541,50 @@ export class PgWorkflowStateStore implements WorkflowStateStore {
     status: WorkflowRunStatus;
     output?: TOutput;
     errorMessage?: string;
+    clearLease?: boolean;
   }): Promise<void> {
     const payloadJson =
       params.output !== undefined ? serializeWithBigInt(params.output) : null;
-    await this.pool.query(
-      `UPDATE workflow_runs
-       SET status = $1,
-           output_payload = COALESCE($2::jsonb, output_payload),
-           error_message = COALESCE($3, error_message),
-           updated_at = $4::timestamptz
-       WHERE id = $5::uuid`,
-      [
-        params.status,
-        payloadJson,
-        params.errorMessage ?? null,
-        new Date().toISOString(),
-        params.runId,
-      ]
-    );
+    const shouldClearLease =
+      params.clearLease ||
+      params.status === "COMPLETED" ||
+      params.status === "COMPENSATED";
+
+    if (shouldClearLease) {
+      await this.pool.query(
+        `UPDATE workflow_runs
+         SET status = $1,
+             output_payload = COALESCE($2::jsonb, output_payload),
+             error_message = COALESCE($3, error_message),
+             locked_by = NULL,
+             lease_expires_at = NULL,
+             updated_at = $4::timestamptz
+         WHERE id = $5::uuid`,
+        [
+          params.status,
+          payloadJson,
+          params.errorMessage ?? null,
+          new Date().toISOString(),
+          params.runId,
+        ]
+      );
+    } else {
+      await this.pool.query(
+        `UPDATE workflow_runs
+         SET status = $1,
+             output_payload = COALESCE($2::jsonb, output_payload),
+             error_message = COALESCE($3, error_message),
+             updated_at = $4::timestamptz
+         WHERE id = $5::uuid`,
+        [
+          params.status,
+          payloadJson,
+          params.errorMessage ?? null,
+          new Date().toISOString(),
+          params.runId,
+        ]
+      );
+    }
   }
 
   async listRecentRuns(limit = 20): Promise<readonly PersistedWorkflowRunSummary[]> {
@@ -465,9 +679,6 @@ export function createStep<TInput, TOutput>(
 export interface WorkflowExecutionContext {
   readonly runId: string;
   readonly idempotencyKey: string;
-  /**
-   * Executes a durable step, or replays its persisted output if already completed in a prior attempt.
-   */
   run<TStepInput, TStepOutput>(
     step: StepDefinition<TStepInput, TStepOutput>,
     input: TStepInput
@@ -483,14 +694,19 @@ export interface WorkflowExecutionResult<TOutput> {
   readonly replayedSteps: readonly string[];
 }
 
+export interface WorkflowExecuteOptions {
+  readonly idempotencyKey: string;
+  readonly store: WorkflowStateStore;
+  readonly workerId?: string;
+  readonly leaseDurationMs?: number;
+  readonly nowMs?: number;
+}
+
 export interface WorkflowDefinition<TInput, TOutput> {
   readonly name: string;
   execute(
     input: TInput,
-    options: {
-      idempotencyKey: string;
-      store: WorkflowStateStore;
-    }
+    options: WorkflowExecuteOptions
   ): Promise<WorkflowExecutionResult<TOutput>>;
 }
 
@@ -505,14 +721,17 @@ export function createWorkflow<TInput, TOutput>(
 ): WorkflowDefinition<TInput, TOutput> {
   return {
     name: workflowName,
-    async execute(input, { idempotencyKey, store }) {
+    async execute(input, options) {
+      const { idempotencyKey, store } = options;
+      const workerId = options.workerId ?? `wf_worker_${randomUUID().slice(0, 8)}`;
+      const leaseDurationMs = options.leaseDurationMs ?? 30_000;
+
       const persistedRun = await store.getOrCreateRun({
         workflowName,
         idempotencyKey,
         input,
       });
 
-      // Short-circuit if the workflow already completed idempotently
       if (persistedRun.status === "COMPLETED") {
         return {
           runId: persistedRun.id,
@@ -523,10 +742,46 @@ export function createWorkflow<TInput, TOutput>(
         };
       }
 
-      // Reset status to RUNNING when resuming a crashed run
-      await store.updateRunStatus({
-        runId: persistedRun.id,
-        status: "RUNNING",
+      if (store.tryAcquireRunLease) {
+        const acquired = await store.tryAcquireRunLease({
+          runId: persistedRun.id,
+          workerId,
+          leaseDurationMs,
+          nowMs: options.nowMs,
+        });
+        if (!acquired) {
+          // Re-check if the concurrent holder just finished completing it
+          const recheck = await store.getOrCreateRun({
+            workflowName,
+            idempotencyKey,
+            input,
+          });
+          if (recheck.status === "COMPLETED") {
+            return {
+              runId: recheck.id,
+              status: "COMPLETED",
+              output: recheck.outputPayload as TOutput,
+              compensatedSteps: [],
+              replayedSteps: Array.from(recheck.steps.keys()),
+            };
+          }
+          throw new WorkflowConcurrentExecutionError({
+            idempotencyKey,
+            runId: persistedRun.id,
+          });
+        }
+      } else {
+        await store.updateRunStatus({
+          runId: persistedRun.id,
+          status: "RUNNING",
+        });
+      }
+
+      // Reload latest persisted steps after acquiring the lease
+      const leasedSnapshot = await store.getOrCreateRun({
+        workflowName,
+        idempotencyKey,
+        input,
       });
 
       interface ExecutedStepEntry {
@@ -540,14 +795,14 @@ export function createWorkflow<TInput, TOutput>(
       let stepCounter = 0;
 
       const ctx: WorkflowExecutionContext = {
-        runId: persistedRun.id,
+        runId: leasedSnapshot.id,
         idempotencyKey,
         async run<TStepInput, TStepOutput>(
           step: StepDefinition<TStepInput, TStepOutput>,
           stepInput: TStepInput
         ): Promise<TStepOutput> {
           stepCounter += 1;
-          const existingLog = persistedRun.steps.get(step.name);
+          const existingLog = leasedSnapshot.steps.get(step.name);
 
           if (existingLog && existingLog.status === "COMPLETED") {
             replayedSteps.push(step.name);
@@ -571,7 +826,7 @@ export function createWorkflow<TInput, TOutput>(
             try {
               const output = await step.invoke(stepInput);
               await store.recordStepSuccess({
-                runId: persistedRun.id,
+                runId: leasedSnapshot.id,
                 stepName: step.name,
                 stepOrder: stepCounter,
                 output,
@@ -588,6 +843,9 @@ export function createWorkflow<TInput, TOutput>(
 
               return output;
             } catch (err) {
+              if (err instanceof ProcessCrashSimulatedError) {
+                throw err;
+              }
               lastError = err;
               if (attempt < maxRetries) {
                 await sleep(retryDelayMs * (attempt + 1));
@@ -604,32 +862,37 @@ export function createWorkflow<TInput, TOutput>(
       try {
         const finalOutput = await handler(input, ctx);
         await store.updateRunStatus({
-          runId: persistedRun.id,
+          runId: leasedSnapshot.id,
           status: "COMPLETED",
           output: finalOutput,
+          clearLease: true,
         });
         return {
-          runId: persistedRun.id,
+          runId: leasedSnapshot.id,
           status: "COMPLETED",
           output: finalOutput,
           compensatedSteps,
           replayedSteps,
         };
       } catch (err) {
+        if (err instanceof ProcessCrashSimulatedError) {
+          // Leave run in RUNNING with its lease intact so SagaRecoveryWorker recovers it after TTL
+          throw err;
+        }
+
         const errorObj = err instanceof Error ? err : new Error(String(err));
         await store.updateRunStatus({
-          runId: persistedRun.id,
+          runId: leasedSnapshot.id,
           status: "COMPENSATING",
           errorMessage: errorObj.message,
         });
 
-        // Execute compensations in strict reverse (LIFO) order
         for (let i = executedStack.length - 1; i >= 0; i--) {
           const entry = executedStack[i]!;
           if (entry.compensate) {
             await entry.compensate();
             await store.recordStepCompensated({
-              runId: persistedRun.id,
+              runId: leasedSnapshot.id,
               stepName: entry.stepName,
             });
             compensatedSteps.push(entry.stepName);
@@ -637,13 +900,14 @@ export function createWorkflow<TInput, TOutput>(
         }
 
         await store.updateRunStatus({
-          runId: persistedRun.id,
+          runId: leasedSnapshot.id,
           status: "COMPENSATED",
           errorMessage: errorObj.message,
+          clearLease: true,
         });
 
         return {
-          runId: persistedRun.id,
+          runId: leasedSnapshot.id,
           status: "COMPENSATED",
           error: errorObj,
           compensatedSteps,
@@ -652,4 +916,124 @@ export function createWorkflow<TInput, TOutput>(
       }
     },
   };
+}
+
+export interface SagaRecoveryItemReport {
+  readonly runId: string;
+  readonly workflowName: string;
+  readonly idempotencyKey: string;
+  readonly finalStatus: WorkflowRunStatus | "SKIPPED_CONCURRENT" | "UNREGISTERED_WORKFLOW";
+  readonly replayedSteps: readonly string[];
+  readonly compensatedSteps: readonly string[];
+}
+
+export interface SagaRecoveryBatchReport {
+  readonly scannedCount: number;
+  readonly recoveredCount: number;
+  readonly items: readonly SagaRecoveryItemReport[];
+}
+
+/**
+ * Autonomous Background Saga Recovery Daemon (`SagaRecoveryWorker`).
+ *
+ * Periodically scans `workflow_runs` for orphaned `RUNNING` / `COMPENSATING` transactions
+ * whose worker lease has expired (e.g. after a container OOM / `SIGKILL` post-payment capture)
+ * and drives them deterministically to `COMPLETED` or `COMPENSATED`.
+ */
+export class SagaRecoveryWorker {
+  private readonly store: WorkflowStateStore;
+  private readonly workflows = new Map<string, WorkflowDefinition<unknown, unknown>>();
+  private readonly workerId: string;
+  private readonly leaseDurationMs: number;
+
+  constructor(params: {
+    store: WorkflowStateStore;
+    workflows?: readonly WorkflowDefinition<any, any>[];
+    workerId?: string;
+    leaseDurationMs?: number;
+  }) {
+    this.store = params.store;
+    this.workerId = params.workerId ?? `saga_reaper_${randomUUID().slice(0, 8)}`;
+    this.leaseDurationMs = params.leaseDurationMs ?? 30_000;
+    for (const wf of params.workflows ?? []) {
+      this.registerWorkflow(wf);
+    }
+  }
+
+  registerWorkflow<TIn, TOut>(workflow: WorkflowDefinition<TIn, TOut>): void {
+    this.workflows.set(
+      workflow.name,
+      workflow as unknown as WorkflowDefinition<unknown, unknown>
+    );
+  }
+
+  async recoverOrphanedRuns(params?: {
+    nowMs?: number;
+    limit?: number;
+  }): Promise<SagaRecoveryBatchReport> {
+    if (!this.store.listExpiredOrphanRuns) {
+      return { scannedCount: 0, recoveredCount: 0, items: [] };
+    }
+
+    const candidates = await this.store.listExpiredOrphanRuns({
+      nowMs: params?.nowMs,
+      limit: params?.limit ?? 25,
+    });
+
+    const items: SagaRecoveryItemReport[] = [];
+    let recoveredCount = 0;
+
+    for (const cand of candidates) {
+      const wf = this.workflows.get(cand.workflowName);
+      if (!wf) {
+        items.push({
+          runId: cand.id,
+          workflowName: cand.workflowName,
+          idempotencyKey: cand.idempotencyKey,
+          finalStatus: "UNREGISTERED_WORKFLOW",
+          replayedSteps: [],
+          compensatedSteps: [],
+        });
+        continue;
+      }
+
+      try {
+        const res = await wf.execute(cand.inputPayload, {
+          idempotencyKey: cand.idempotencyKey,
+          store: this.store,
+          workerId: this.workerId,
+          leaseDurationMs: this.leaseDurationMs,
+          nowMs: params?.nowMs,
+        });
+        recoveredCount += 1;
+        items.push({
+          runId: cand.id,
+          workflowName: cand.workflowName,
+          idempotencyKey: cand.idempotencyKey,
+          finalStatus: res.status,
+          replayedSteps: res.replayedSteps,
+          compensatedSteps: res.compensatedSteps,
+        });
+      } catch (err) {
+        if (err instanceof WorkflowConcurrentExecutionError) {
+          items.push({
+            runId: cand.id,
+            workflowName: cand.workflowName,
+            idempotencyKey: cand.idempotencyKey,
+            finalStatus: "SKIPPED_CONCURRENT",
+            replayedSteps: [],
+            compensatedSteps: [],
+          });
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    return {
+      scannedCount: candidates.length,
+      recoveredCount,
+      items,
+    };
+  }
 }

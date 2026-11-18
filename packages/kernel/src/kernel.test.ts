@@ -5,11 +5,14 @@ import {
   applyBps,
   calculateCart,
   calculateReturnRefund,
+  currencyExponent,
   evaluateB2bPurchasePolicy,
+  formatMinorUnits,
   instantiateWasmPricingKernel,
   isNativeRustKernelLoaded,
   runKernelBenchmarkSuite,
 } from "./index.ts";
+import { getNativeRustKernel } from "./rust-bridge.ts";
 
 describe("@super-ecommerce/kernel (Native Rust N-API + WASM Bridge)", () => {
   it("loads the compiled Rust N-API binary (commerce_kernel.node) and matches WASM pricing bit-for-bit", async () => {
@@ -265,5 +268,102 @@ describe("@super-ecommerce/kernel (Native Rust N-API + WASM Bridge)", () => {
     assert.equal(pendingRes.decision, "PENDING_APPROVAL");
     assert.equal(pendingRes.pricing.totalGrossAmount, 427_500n);
     assert.equal(pendingRes.recommendedReservationTtlSeconds, 259_200);
+  });
+
+  it("compiles full commerce-kernel to WebAssembly (commerce_kernel.wasm) with bit-for-bit cart & RMA parity", async () => {
+    const wasmKernel = await instantiateWasmPricingKernel();
+    assert.equal(wasmKernel.isCompiledFromRustCrate, true);
+    assert.ok(wasmKernel.calculateCart, "Expected full calculateCart export on Rust WASM kernel");
+
+    const cartInput = {
+      currencyCode: "EUR",
+      taxMode: "TAX_INCLUSIVE" as const,
+      shippingBaseAmount: 1200n,
+      shippingTaxRateBps: 2000,
+      lines: [
+        {
+          lineId: "L-1",
+          variantId: "VAR-A",
+          quantity: 1,
+          baseUnitPrice: 1000n,
+          taxRateBps: 2000,
+        },
+        {
+          lineId: "L-2",
+          variantId: "VAR-B",
+          quantity: 1,
+          baseUnitPrice: 1000n,
+          taxRateBps: 2000,
+        },
+        {
+          lineId: "L-3",
+          variantId: "VAR-C",
+          quantity: 1,
+          baseUnitPrice: 1000n,
+          taxRateBps: 2000,
+        },
+      ],
+      candidateOrderDiscounts: [
+        {
+          discountId: "v-1000",
+          name: "10 EUR Voucher",
+          kind: "ORDER_VOUCHER" as const,
+          value: { type: "FIXED" as const, amount: 1000n },
+        },
+      ],
+    };
+
+    const nativeRes = calculateCart(cartInput);
+    const wasmRes = wasmKernel.calculateCart!(cartInput);
+    assert.deepEqual(wasmRes, nativeRes);
+  });
+
+  it("enforces ISO-4217 multi-currency exponents, Gross Margin Floor Guard, N-API argument safety, and wire injection immunity", () => {
+    assert.equal(currencyExponent("JPY"), 0);
+    assert.equal(currencyExponent("USD"), 2);
+    assert.equal(currencyExponent("KWD"), 3);
+    assert.equal(formatMinorUnits(15800n, "JPY"), "15800");
+    assert.equal(formatMinorUnits(1999n, "USD"), "19.99");
+    assert.equal(formatMinorUnits(12345n, "KWD"), "12.345");
+
+    // Hostile tab/newline injection in discount name & Gross Margin Floor Guard clamping
+    const hostileName = "VIP\t999999\nODISC\tinject-999\tInjected\tMANUAL_ORDER\tFIXED\t99999";
+    const guarded = calculateCart({
+      currencyCode: "USD",
+      taxMode: "TAX_EXCLUSIVE",
+      shippingBaseAmount: 0n,
+      shippingTaxRateBps: 0,
+      lines: [
+        {
+          lineId: "L\t1\nX",
+          variantId: "SKU\tTI",
+          quantity: 1,
+          baseUnitPrice: 15_000n,
+          unitCostAmount: 8_000n,
+          minMarginBps: 2_000, // 20% gross margin floor => min net $100.00 (10_000)
+          taxRateBps: 0,
+          candidateLineDiscounts: [
+            {
+              discountId: "d\t1",
+              name: hostileName,
+              kind: "CATALOGUE_PROMOTION",
+              value: { type: "PERCENTAGE", bps: 5000 }, // Tries $75 off -> clamped to $50 off!
+            },
+          ],
+        },
+      ],
+    });
+
+    assert.equal(guarded.appliedOrderDiscounts.length, 0);
+    assert.equal(guarded.lines[0]?.lineId, "L\t1\nX");
+    assert.equal(guarded.lines[0]?.discountAttributions[0]?.name, hostileName);
+    assert.equal(guarded.lines[0]?.lineLevelDiscountAmount, 5_000n);
+    assert.equal(guarded.lines[0]?.marginGuardClampedAmount, 2_500n);
+    assert.equal(guarded.lines[0]?.totalNetAmount, 10_000n);
+
+    // N-API null/missing argument guard throws TypeError cleanly instead of Segfaulting
+    const rawNative = getNativeRustKernel() as unknown as Record<string, (...args: unknown[]) => unknown>;
+    assert.throws(() => rawNative["rustCalculateCart"]!(), TypeError);
+    assert.throws(() => rawNative["rustApplyBps"]!("not-a-bigint", 500), TypeError);
   });
 });

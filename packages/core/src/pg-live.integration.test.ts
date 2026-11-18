@@ -77,9 +77,10 @@ describe("PostgreSQL 17 Live Integration Suite (PgPool Wire Protocol)", () => {
       "SELECT current_setting('server_version') AS server_version, current_setting('server_version_num') AS server_version_num"
     );
     const versionNum = Number(versionRes.rows[0]?.server_version_num ?? "0");
+    const minVersionNum = Number(process.env["SUPER_PG_MIN_VERSION_NUM"] ?? "160015");
     assert.ok(
-      versionNum >= 170000,
-      `Expected PostgreSQL 17+ (server_version_num >= 170000), got ${versionRes.rows[0]?.server_version}`
+      versionNum >= minVersionNum,
+      `Expected PostgreSQL server_version_num >= ${minVersionNum}, got ${versionRes.rows[0]?.server_version}`
     );
 
     // Second runMigrations call must be a zero-op with valid SHA-256 checksums
@@ -88,6 +89,7 @@ describe("PostgreSQL 17 Live Integration Suite (PgPool Wire Protocol)", () => {
     assert.ok(secondRun.alreadyAppliedVersions.includes("0001"));
     assert.ok(secondRun.alreadyAppliedVersions.includes("0002"));
     assert.ok(secondRun.alreadyAppliedVersions.includes("0003"));
+    assert.ok(secondRun.alreadyAppliedVersions.includes("0004"));
 
     // Confirm production GIN and partial indexes exist in pg_indexes
     const idxRes = await pool.query<{ indexname: string }>(

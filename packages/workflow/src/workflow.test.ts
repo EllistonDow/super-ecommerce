@@ -5,6 +5,9 @@ import {
   createWorkflow,
   InMemoryWorkflowStateStore,
   PgWorkflowStateStore,
+  ProcessCrashSimulatedError,
+  SagaRecoveryWorker,
+  WorkflowConcurrentExecutionError,
 } from "./index.ts";
 import { OfflinePgPool, runMigrations } from "@super-ecommerce/db";
 
@@ -308,6 +311,107 @@ describe("@super-ecommerce/workflow", () => {
       assert.equal(lifoRow.status, "COMPENSATED");
       assert.equal(lifoRow.errorMessage, "GATEWAY_TIMEOUT");
       assert.deepEqual(lifoRow.compensatedLifoChain, ["redeem-gift-card", "reserve-stock"]);
+    } finally {
+      await pg.close();
+    }
+  });
+
+  it("enforces mutual-exclusion leases against concurrent duplicate idempotencyKeys and recovers zombie crashed runs via SagaRecoveryWorker", async () => {
+    const pg = new OfflinePgPool();
+    await runMigrations(pg);
+    try {
+      const store = new PgWorkflowStateStore(pg);
+      let chargeInvocations = 0;
+
+      // 1. Concurrent race on the same idempotencyKey: second caller gets WorkflowConcurrentExecutionError
+      const slowChargeStep = createStep({
+        name: "slow-gateway-capture",
+        invoke: async (amt: bigint) => {
+          chargeInvocations += 1;
+          await new Promise((r) => setTimeout(r, 40));
+          return { txId: `tx_${chargeInvocations}`, amt };
+        },
+      });
+      const raceWf = createWorkflow("race-guard-wf", async (amt: bigint, ctx) => {
+        return await ctx.run(slowChargeStep, amt);
+      });
+
+      const [firstOutcome, secondOutcome] = await Promise.allSettled([
+        raceWf.execute(19_900n, {
+          idempotencyKey: "idem-race-mutex-1",
+          store,
+          leaseDurationMs: 5_000,
+        }),
+        (async () => {
+          await new Promise((r) => setTimeout(r, 8));
+          return await raceWf.execute(19_900n, {
+            idempotencyKey: "idem-race-mutex-1",
+            store,
+            leaseDurationMs: 5_000,
+          });
+        })(),
+      ]);
+
+      assert.equal(firstOutcome.status, "fulfilled");
+      assert.equal(secondOutcome.status, "rejected");
+      assert.ok(secondOutcome.reason instanceof WorkflowConcurrentExecutionError);
+      assert.equal(chargeInvocations, 1, "Gateway capture must execute strictly once");
+
+      // 2. Process crash mid-flight -> lease expires -> SagaRecoveryWorker resumes & completes automatically
+      let zombieCharges = 0;
+      let shouldCrashStep2 = true;
+
+      const zombieStep1 = createStep({
+        name: "capture-stripe",
+        invoke: async (amt: bigint) => {
+          zombieCharges += 1;
+          return { pi: "pi_zombie_01", amt };
+        },
+      });
+      const zombieStep2 = createStep({
+        name: "persist-order",
+        invoke: async (p: { pi: string; amt: bigint }) => {
+          if (shouldCrashStep2) {
+            throw new ProcessCrashSimulatedError("OOM_KILLED_AFTER_STRIPE_CAPTURE");
+          }
+          return { orderId: "ord_recovered_01", pi: p.pi, amt: p.amt };
+        },
+      });
+      const zombieWf = createWorkflow("zombie-checkout-wf", async (amt: bigint, ctx) => {
+        const pay = await ctx.run(zombieStep1, amt);
+        return await ctx.run(zombieStep2, pay);
+      });
+
+      const t0 = Date.now();
+      await assert.rejects(
+        () =>
+          zombieWf.execute(88_000n, {
+            idempotencyKey: "idem-zombie-1",
+            store,
+            leaseDurationMs: 1_000,
+            nowMs: t0,
+          }),
+        ProcessCrashSimulatedError
+      );
+      assert.equal(zombieCharges, 1);
+
+      const recoveryWorker = new SagaRecoveryWorker({
+        store,
+        workflows: [zombieWf],
+      });
+
+      // Before lease expires (t0 + 200ms): 0 runs eligible
+      const prematureScan = await recoveryWorker.recoverOrphanedRuns({ nowMs: t0 + 200 });
+      assert.equal(prematureScan.scannedCount, 0);
+
+      // After lease expires (t0 + 1500ms): SagaRecoveryWorker claims & completes without re-charging!
+      shouldCrashStep2 = false;
+      const recoveredScan = await recoveryWorker.recoverOrphanedRuns({ nowMs: t0 + 1_500 });
+      assert.equal(recoveredScan.scannedCount, 1);
+      assert.equal(recoveredScan.recoveredCount, 1);
+      assert.equal(recoveredScan.items[0]?.finalStatus, "COMPLETED");
+      assert.deepEqual(recoveredScan.items[0]?.replayedSteps, ["capture-stripe"]);
+      assert.equal(zombieCharges, 1, "Recovered saga must NOT double-charge Stripe");
     } finally {
       await pg.close();
     }
