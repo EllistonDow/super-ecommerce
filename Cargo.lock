@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "commerce-kernel"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "kernel-napi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "commerce-kernel",
 ]

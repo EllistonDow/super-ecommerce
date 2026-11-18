@@ -1,6 +1,6 @@
 {
   "name": "super-ecommerce",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Next-generation full-stack headless commerce engine powered by TypeScript, Rust commerce-kernel, and PostgreSQL 17",
   "type": "module",
