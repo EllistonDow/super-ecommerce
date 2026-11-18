@@ -5,7 +5,6 @@
  */
 
 import {
-  SqlDatabaseEngine,
   type AllocationStrategy,
   type PgPoolLike,
   type PgQueryable,
@@ -113,45 +112,10 @@ export class InsufficientStockError extends Error {
 
 export class MsiInventoryService {
   private readonly slots: WarehouseStockState[];
-  private readonly sqlEngine?: SqlDatabaseEngine;
   private readonly activeReservations = new Map<string, StockReservationRecord>();
 
-  constructor(
-    initialSlots: readonly WarehouseStockState[] = [],
-    sqlEngine?: SqlDatabaseEngine
-  ) {
+  constructor(initialSlots: readonly WarehouseStockState[] = []) {
     this.slots = initialSlots.map((s) => ({ ...s }));
-    this.sqlEngine = sqlEngine;
-
-    if (this.sqlEngine && initialSlots.length > 0) {
-      this.sqlEngine.inTransaction(() => {
-        const stmt = this.sqlEngine!.db.prepare(
-          `INSERT INTO stock_quants (
-             warehouse_id, priority_rank, linked_to_channel, supports_shipping_zone,
-             variant_id, quantity_on_hand, quantity_reserved, quantity_allocated
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (warehouse_id, variant_id) DO UPDATE SET
-             priority_rank = excluded.priority_rank,
-             linked_to_channel = excluded.linked_to_channel,
-             supports_shipping_zone = excluded.supports_shipping_zone,
-             quantity_on_hand = excluded.quantity_on_hand,
-             quantity_reserved = excluded.quantity_reserved,
-             quantity_allocated = excluded.quantity_allocated`
-        );
-        for (const s of initialSlots) {
-          stmt.run(
-            s.warehouseId,
-            s.priorityRank,
-            s.linkedToChannel ? 1 : 0,
-            s.supportsShippingZone ? 1 : 0,
-            s.variantId,
-            s.quantityOnHand,
-            s.quantityReserved,
-            s.quantityAllocated
-          );
-        }
-      });
-    }
   }
 
   getAvailableQuantity(slot: WarehouseStockState): number {
@@ -162,46 +126,13 @@ export class MsiInventoryService {
   }
 
   getSlot(warehouseId: string, variantId: string): WarehouseStockState | undefined {
-    if (this.sqlEngine) {
-      const row = this.sqlEngine.db
-        .prepare(
-          `SELECT warehouse_id, priority_rank, linked_to_channel, supports_shipping_zone,
-                  variant_id, quantity_on_hand, quantity_reserved, quantity_allocated
-           FROM stock_quants WHERE warehouse_id = ? AND variant_id = ?`
-        )
-        .get(warehouseId, variantId) as
-        | {
-            warehouse_id: string;
-            priority_rank: number;
-            linked_to_channel: number;
-            supports_shipping_zone: number;
-            variant_id: string;
-            quantity_on_hand: number;
-            quantity_reserved: number;
-            quantity_allocated: number;
-          }
-        | undefined;
-      if (row) {
-        return {
-          warehouseId: row.warehouse_id,
-          priorityRank: row.priority_rank,
-          linkedToChannel: row.linked_to_channel === 1,
-          supportsShippingZone: row.supports_shipping_zone === 1,
-          variantId: row.variant_id,
-          quantityOnHand: row.quantity_on_hand,
-          quantityReserved: row.quantity_reserved,
-          quantityAllocated: row.quantity_allocated,
-        };
-      }
-    }
     return this.slots.find(
       (s) => s.warehouseId === warehouseId && s.variantId === variantId
     );
   }
 
   listAllSlots(limit = 50): WarehouseStockState[] {
-    const all = this.getAllSlotsSnapshot();
-    return [...all]
+    return [...this.slots]
       .sort(
         (a, b) =>
           a.priorityRank - b.priorityRank ||
@@ -218,101 +149,34 @@ export class MsiInventoryService {
     const preserve = options?.preserveAllocated ?? true;
     let count = 0;
 
-    const runUpsert = () => {
-      for (const s of externalSlots) {
-        const existing = this.getSlot(s.warehouseId, s.variantId);
-        const nextAllocated =
-          preserve && existing
-            ? Math.max(existing.quantityAllocated, s.quantityAllocated)
-            : s.quantityAllocated;
+    for (const s of externalSlots) {
+      const existing = this.getSlot(s.warehouseId, s.variantId);
+      const nextAllocated =
+        preserve && existing
+          ? Math.max(existing.quantityAllocated, s.quantityAllocated)
+          : s.quantityAllocated;
 
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `INSERT INTO stock_quants (
-                 warehouse_id, priority_rank, linked_to_channel, supports_shipping_zone,
-                 variant_id, quantity_on_hand, quantity_reserved, quantity_allocated
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT (warehouse_id, variant_id) DO UPDATE SET
-                 priority_rank = excluded.priority_rank,
-                 linked_to_channel = excluded.linked_to_channel,
-                 supports_shipping_zone = excluded.supports_shipping_zone,
-                 quantity_on_hand = excluded.quantity_on_hand,
-                 quantity_reserved = excluded.quantity_reserved,
-                 quantity_allocated = excluded.quantity_allocated`
-            )
-            .run(
-              s.warehouseId,
-              s.priorityRank,
-              s.linkedToChannel ? 1 : 0,
-              s.supportsShippingZone ? 1 : 0,
-              s.variantId,
-              s.quantityOnHand,
-              s.quantityReserved,
-              nextAllocated
-            );
-        }
-
-        const memIdx = this.slots.findIndex(
-          (m) => m.warehouseId === s.warehouseId && m.variantId === s.variantId
-        );
-        const updatedSlot: WarehouseStockState = {
-          ...s,
-          quantityAllocated: nextAllocated,
-        };
-        if (memIdx >= 0) {
-          this.slots[memIdx] = updatedSlot;
-        } else {
-          this.slots.push(updatedSlot);
-        }
-        count++;
+      const memIdx = this.slots.findIndex(
+        (m) => m.warehouseId === s.warehouseId && m.variantId === s.variantId
+      );
+      const updatedSlot: WarehouseStockState = {
+        ...s,
+        quantityAllocated: nextAllocated,
+      };
+      if (memIdx >= 0) {
+        this.slots[memIdx] = updatedSlot;
+      } else {
+        this.slots.push(updatedSlot);
       }
-    };
-
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(runUpsert);
-    } else {
-      runUpsert();
+      count++;
     }
+
     return count;
   }
 
-  private getAllSlotsSnapshot(): WarehouseStockState[] {
-    if (!this.sqlEngine) {
-      return this.slots;
-    }
-    const rows = this.sqlEngine.db
-      .prepare(
-        `SELECT warehouse_id, priority_rank, linked_to_channel, supports_shipping_zone,
-                variant_id, quantity_on_hand, quantity_reserved, quantity_allocated
-         FROM stock_quants`
-      )
-      .all() as {
-      warehouse_id: string;
-      priority_rank: number;
-      linked_to_channel: number;
-      supports_shipping_zone: number;
-      variant_id: string;
-      quantity_on_hand: number;
-      quantity_reserved: number;
-      quantity_allocated: number;
-    }[];
-
-    return rows.map((row) => ({
-      warehouseId: row.warehouse_id,
-      priorityRank: row.priority_rank,
-      linkedToChannel: row.linked_to_channel === 1,
-      supportsShippingZone: row.supports_shipping_zone === 1,
-      variantId: row.variant_id,
-      quantityOnHand: row.quantity_on_hand,
-      quantityReserved: row.quantity_reserved,
-      quantityAllocated: row.quantity_allocated,
-    }));
-  }
-
   /**
-   * Plans and atomically commits stock allocations across warehouses using the compiled
-   * Rust `commerce-kernel` MSI engine and SQL `BEGIN IMMEDIATE` transaction.
+   * Plans and commits stock allocations across warehouses using the compiled
+   * Rust `commerce-kernel` MSI engine.
    * Throws `InsufficientStockError` (without mutating state) if any line cannot be fulfilled.
    */
   allocateForCheckout(params: {
@@ -323,103 +187,67 @@ export class MsiInventoryService {
     shipmentCount: number;
     allocations: readonly ShipmentSlice[];
   } {
-    const executeAllocation = () => {
-      const currentSlots = this.getAllSlotsSnapshot();
-
-      if (isNativeRustKernelLoaded()) {
-        const rustPlan = planInventoryAllocation({
-          availabilityMode: params.availabilityMode,
-          strategy: params.strategy,
-          slots: currentSlots.map((s) => ({
-            warehouseId: s.warehouseId,
-            priorityRank: s.priorityRank,
-            linkedToChannel: s.linkedToChannel,
-            supportsShippingZone: s.supportsShippingZone,
-            variantId: s.variantId,
-            onHand: s.quantityOnHand,
-            reserved: s.quantityReserved,
-            allocated: s.quantityAllocated,
-          })),
-          demands: params.demands,
-        });
-
-        if (!rustPlan.isFullyAllocated && rustPlan.unallocatedLines.length > 0) {
-          const firstUnalloc = rustPlan.unallocatedLines[0]!;
-          const demand = params.demands.find((d) => d.lineId === firstUnalloc.lineId);
-          const requested = demand?.quantity ?? firstUnalloc.missingQuantity;
-          throw new InsufficientStockError({
-            lineId: firstUnalloc.lineId,
-            variantId: firstUnalloc.variantId,
-            requested,
-            available: requested - firstUnalloc.missingQuantity,
-          });
-        }
-
-        // Persist into SQL and in-memory mirror
-        for (const slice of rustPlan.allocations) {
-          if (this.sqlEngine) {
-            this.sqlEngine.db
-              .prepare(
-                `UPDATE stock_quants
-                 SET quantity_allocated = quantity_allocated + ?
-                 WHERE warehouse_id = ? AND variant_id = ?`
-              )
-              .run(slice.quantityAllocated, slice.warehouseId, slice.variantId);
-          }
-          const memSlot = this.slots.find(
-            (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
-          );
-          if (memSlot) {
-            memSlot.quantityAllocated += slice.quantityAllocated;
-          }
-        }
-
-        return {
-          shipmentCount: rustPlan.shipmentCount,
-          allocations: rustPlan.allocations,
-        };
-      }
-
+    if (!isNativeRustKernelLoaded()) {
       throw new Error("Native Rust kernel is required for MSI allocation");
-    };
-
-    if (this.sqlEngine) {
-      return this.sqlEngine.inTransaction(executeAllocation);
     }
-    return executeAllocation();
+
+    const rustPlan = planInventoryAllocation({
+      availabilityMode: params.availabilityMode,
+      strategy: params.strategy,
+      slots: this.slots.map((s) => ({
+        warehouseId: s.warehouseId,
+        priorityRank: s.priorityRank,
+        linkedToChannel: s.linkedToChannel,
+        supportsShippingZone: s.supportsShippingZone,
+        variantId: s.variantId,
+        onHand: s.quantityOnHand,
+        reserved: s.quantityReserved,
+        allocated: s.quantityAllocated,
+      })),
+      demands: params.demands,
+    });
+
+    if (!rustPlan.isFullyAllocated && rustPlan.unallocatedLines.length > 0) {
+      const firstUnalloc = rustPlan.unallocatedLines[0]!;
+      const demand = params.demands.find((d) => d.lineId === firstUnalloc.lineId);
+      const requested = demand?.quantity ?? firstUnalloc.missingQuantity;
+      throw new InsufficientStockError({
+        lineId: firstUnalloc.lineId,
+        variantId: firstUnalloc.variantId,
+        requested,
+        available: requested - firstUnalloc.missingQuantity,
+      });
+    }
+
+    for (const slice of rustPlan.allocations) {
+      const memSlot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (memSlot) {
+        memSlot.quantityAllocated += slice.quantityAllocated;
+      }
+    }
+
+    return {
+      shipmentCount: rustPlan.shipmentCount,
+      allocations: rustPlan.allocations,
+    };
   }
 
   /**
    * Reverse compensation: releases previously allocated quantities back to available pool.
    */
   releaseAllocations(allocations: readonly ShipmentSlice[]): void {
-    const executeRelease = () => {
-      for (const slice of allocations) {
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_allocated = MAX(0, quantity_allocated - ?)
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(slice.quantityAllocated, slice.warehouseId, slice.variantId);
-        }
-        const slot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+    for (const slice of allocations) {
+      const slot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (slot) {
+        slot.quantityAllocated = Math.max(
+          0,
+          slot.quantityAllocated - slice.quantityAllocated
         );
-        if (slot) {
-          slot.quantityAllocated = Math.max(
-            0,
-            slot.quantityAllocated - slice.quantityAllocated
-          );
-        }
       }
-    };
-
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeRelease);
-    } else {
-      executeRelease();
     }
   }
 
@@ -432,37 +260,19 @@ export class MsiInventoryService {
    */
   restockReturnedItems(slices: readonly RestockedShipmentSlice[]): RestockedShipmentSlice[] {
     const applied: RestockedShipmentSlice[] = [];
-    const executeRestock = () => {
-      for (const slice of slices) {
-        if (slice.quantityReturned <= 0) continue;
-        const onHandDelta = slice.condition === "DAMAGED_QUARANTINE" ? slice.quantityReturned : 0;
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_allocated = MAX(0, quantity_allocated - ?),
-                   quantity_on_hand = MAX(0, quantity_on_hand - ?)
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(slice.quantityReturned, onHandDelta, slice.warehouseId, slice.variantId);
+    for (const slice of slices) {
+      if (slice.quantityReturned <= 0) continue;
+      const onHandDelta = slice.condition === "DAMAGED_QUARANTINE" ? slice.quantityReturned : 0;
+      const slot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (slot) {
+        slot.quantityAllocated = Math.max(0, slot.quantityAllocated - slice.quantityReturned);
+        if (onHandDelta > 0) {
+          slot.quantityOnHand = Math.max(0, slot.quantityOnHand - onHandDelta);
         }
-        const slot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
-        );
-        if (slot) {
-          slot.quantityAllocated = Math.max(0, slot.quantityAllocated - slice.quantityReturned);
-          if (onHandDelta > 0) {
-            slot.quantityOnHand = Math.max(0, slot.quantityOnHand - onHandDelta);
-          }
-        }
-        applied.push({ ...slice });
       }
-    };
-
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeRestock);
-    } else {
-      executeRestock();
+      applied.push({ ...slice });
     }
     return applied;
   }
@@ -472,34 +282,16 @@ export class MsiInventoryService {
    * for quarantined items) if a downstream RMA refund step fails.
    */
   revertRmaRestock(slices: readonly RestockedShipmentSlice[]): void {
-    const executeRevert = () => {
-      for (const slice of slices) {
-        if (slice.quantityReturned <= 0) continue;
-        const onHandDelta = slice.condition === "DAMAGED_QUARANTINE" ? slice.quantityReturned : 0;
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_allocated = quantity_allocated + ?,
-                   quantity_on_hand = quantity_on_hand + ?
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(slice.quantityReturned, onHandDelta, slice.warehouseId, slice.variantId);
-        }
-        const slot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
-        );
-        if (slot) {
-          slot.quantityAllocated += slice.quantityReturned;
-          slot.quantityOnHand += onHandDelta;
-        }
+    for (const slice of slices) {
+      if (slice.quantityReturned <= 0) continue;
+      const onHandDelta = slice.condition === "DAMAGED_QUARANTINE" ? slice.quantityReturned : 0;
+      const slot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (slot) {
+        slot.quantityAllocated += slice.quantityReturned;
+        slot.quantityOnHand += onHandDelta;
       }
-    };
-
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeRevert);
-    } else {
-      executeRevert();
     }
   }
 
@@ -507,32 +299,15 @@ export class MsiInventoryService {
    * Deducts allocated and on-hand stock when an order is dispatched for fulfillment.
    */
   deductAllocatedStock(slices: readonly ShipmentSlice[]): void {
-    const executeDeduct = () => {
-      for (const slice of slices) {
-        if (slice.quantityAllocated <= 0) continue;
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_allocated = MAX(0, quantity_allocated - ?),
-                   quantity_on_hand = MAX(0, quantity_on_hand - ?)
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(slice.quantityAllocated, slice.quantityAllocated, slice.warehouseId, slice.variantId);
-        }
-        const slot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
-        );
-        if (slot) {
-          slot.quantityAllocated = Math.max(0, slot.quantityAllocated - slice.quantityAllocated);
-          slot.quantityOnHand = Math.max(0, slot.quantityOnHand - slice.quantityAllocated);
-        }
+    for (const slice of slices) {
+      if (slice.quantityAllocated <= 0) continue;
+      const slot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (slot) {
+        slot.quantityAllocated = Math.max(0, slot.quantityAllocated - slice.quantityAllocated);
+        slot.quantityOnHand = Math.max(0, slot.quantityOnHand - slice.quantityAllocated);
       }
-    };
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeDeduct);
-    } else {
-      executeDeduct();
     }
   }
 
@@ -541,32 +316,15 @@ export class MsiInventoryService {
    * if downstream fulfillment steps fail.
    */
   revertDeductAllocatedStock(slices: readonly ShipmentSlice[]): void {
-    const executeRevert = () => {
-      for (const slice of slices) {
-        if (slice.quantityAllocated <= 0) continue;
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_allocated = quantity_allocated + ?,
-                   quantity_on_hand = quantity_on_hand + ?
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(slice.quantityAllocated, slice.quantityAllocated, slice.warehouseId, slice.variantId);
-        }
-        const slot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
-        );
-        if (slot) {
-          slot.quantityAllocated += slice.quantityAllocated;
-          slot.quantityOnHand += slice.quantityAllocated;
-        }
+    for (const slice of slices) {
+      if (slice.quantityAllocated <= 0) continue;
+      const slot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (slot) {
+        slot.quantityAllocated += slice.quantityAllocated;
+        slot.quantityOnHand += slice.quantityAllocated;
       }
-    };
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeRevert);
-    } else {
-      executeRevert();
     }
   }
 
@@ -590,100 +348,64 @@ export class MsiInventoryService {
     const createdAt = new Date(now).toISOString();
     const expiresAt = new Date(now + params.ttlSeconds * 1000).toISOString();
 
-    const executeReserve = () => {
-      const currentSlots = this.getAllSlotsSnapshot();
-      const rustPlan = planInventoryAllocation({
-        availabilityMode: params.availabilityMode,
-        strategy: params.strategy,
-        slots: currentSlots.map((s) => ({
-          warehouseId: s.warehouseId,
-          priorityRank: s.priorityRank,
-          linkedToChannel: s.linkedToChannel,
-          supportsShippingZone: s.supportsShippingZone,
-          variantId: s.variantId,
-          onHand: s.quantityOnHand,
-          reserved: s.quantityReserved,
-          allocated: s.quantityAllocated,
-        })),
-        demands: params.demands,
+    const rustPlan = planInventoryAllocation({
+      availabilityMode: params.availabilityMode,
+      strategy: params.strategy,
+      slots: this.slots.map((s) => ({
+        warehouseId: s.warehouseId,
+        priorityRank: s.priorityRank,
+        linkedToChannel: s.linkedToChannel,
+        supportsShippingZone: s.supportsShippingZone,
+        variantId: s.variantId,
+        onHand: s.quantityOnHand,
+        reserved: s.quantityReserved,
+        allocated: s.quantityAllocated,
+      })),
+      demands: params.demands,
+    });
+
+    if (!rustPlan.isFullyAllocated && rustPlan.unallocatedLines.length > 0) {
+      const firstUnalloc = rustPlan.unallocatedLines[0]!;
+      const demand = params.demands.find((d) => d.lineId === firstUnalloc.lineId);
+      const requested = demand?.quantity ?? firstUnalloc.missingQuantity;
+      throw new InsufficientStockError({
+        lineId: firstUnalloc.lineId,
+        variantId: firstUnalloc.variantId,
+        requested,
+        available: requested - firstUnalloc.missingQuantity,
       });
-
-      if (!rustPlan.isFullyAllocated && rustPlan.unallocatedLines.length > 0) {
-        const firstUnalloc = rustPlan.unallocatedLines[0]!;
-        const demand = params.demands.find((d) => d.lineId === firstUnalloc.lineId);
-        const requested = demand?.quantity ?? firstUnalloc.missingQuantity;
-        throw new InsufficientStockError({
-          lineId: firstUnalloc.lineId,
-          variantId: firstUnalloc.variantId,
-          requested,
-          available: requested - firstUnalloc.missingQuantity,
-        });
-      }
-
-      for (let i = 0; i < rustPlan.allocations.length; i++) {
-        const slice = rustPlan.allocations[i]!;
-        const reservationId = `res_${params.holderId}_${i + 1}`;
-        const resRecord: StockReservationRecord = {
-          reservationId,
-          holderId: params.holderId,
-          warehouseId: slice.warehouseId,
-          variantId: slice.variantId,
-          lineId: slice.lineId,
-          quantity: slice.quantityAllocated,
-          status: "ACTIVE",
-          ttlSeconds: params.ttlSeconds,
-          expiresAt,
-          createdAt,
-        };
-        this.activeReservations.set(reservationId, resRecord);
-
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_reserved = quantity_reserved + ?
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(slice.quantityAllocated, slice.warehouseId, slice.variantId);
-
-          this.sqlEngine.db
-            .prepare(
-              `INSERT INTO stock_reservations (
-                 reservation_id, holder_id, warehouse_id, variant_id, line_id,
-                 quantity, status, ttl_seconds, expires_at, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?)`
-            )
-            .run(
-              reservationId,
-              params.holderId,
-              slice.warehouseId,
-              slice.variantId,
-              slice.lineId,
-              slice.quantityAllocated,
-              params.ttlSeconds,
-              expiresAt,
-              createdAt
-            );
-        }
-        const memSlot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
-        );
-        if (memSlot) {
-          memSlot.quantityReserved += slice.quantityAllocated;
-        }
-      }
-
-      return {
-        shipmentCount: rustPlan.shipmentCount,
-        reservationSlices: rustPlan.allocations,
-        expiresAt,
-      };
-    };
-
-    if (this.sqlEngine) {
-      return this.sqlEngine.inTransaction(executeReserve);
     }
-    return executeReserve();
+
+    for (let i = 0; i < rustPlan.allocations.length; i++) {
+      const slice = rustPlan.allocations[i]!;
+      const reservationId = `res_${params.holderId}_${i + 1}`;
+      const resRecord: StockReservationRecord = {
+        reservationId,
+        holderId: params.holderId,
+        warehouseId: slice.warehouseId,
+        variantId: slice.variantId,
+        lineId: slice.lineId,
+        quantity: slice.quantityAllocated,
+        status: "ACTIVE",
+        ttlSeconds: params.ttlSeconds,
+        expiresAt,
+        createdAt,
+      };
+      this.activeReservations.set(reservationId, resRecord);
+
+      const memSlot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (memSlot) {
+        memSlot.quantityReserved += slice.quantityAllocated;
+      }
+    }
+
+    return {
+      shipmentCount: rustPlan.shipmentCount,
+      reservationSlices: rustPlan.allocations,
+      expiresAt,
+    };
   }
 
   /**
@@ -694,54 +416,22 @@ export class MsiInventoryService {
     holderId: string,
     slices: readonly ShipmentSlice[]
   ): void {
-    const executeConvert = () => {
-      for (const slice of slices) {
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_reserved = MAX(0, quantity_reserved - ?),
-                   quantity_allocated = quantity_allocated + ?
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(
-              slice.quantityAllocated,
-              slice.quantityAllocated,
-              slice.warehouseId,
-              slice.variantId
-            );
-        }
-        const memSlot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+    for (const slice of slices) {
+      const memSlot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (memSlot) {
+        memSlot.quantityReserved = Math.max(
+          0,
+          memSlot.quantityReserved - slice.quantityAllocated
         );
-        if (memSlot) {
-          memSlot.quantityReserved = Math.max(
-            0,
-            memSlot.quantityReserved - slice.quantityAllocated
-          );
-          memSlot.quantityAllocated += slice.quantityAllocated;
-        }
+        memSlot.quantityAllocated += slice.quantityAllocated;
       }
-      for (const r of this.activeReservations.values()) {
-        if (r.holderId === holderId && r.status === "ACTIVE") {
-          r.status = "CONVERTED_TO_ALLOCATION";
-        }
+    }
+    for (const r of this.activeReservations.values()) {
+      if (r.holderId === holderId && r.status === "ACTIVE") {
+        r.status = "CONVERTED_TO_ALLOCATION";
       }
-      if (this.sqlEngine) {
-        this.sqlEngine.db
-          .prepare(
-            `UPDATE stock_reservations
-             SET status = 'CONVERTED_TO_ALLOCATION'
-             WHERE holder_id = ? AND status = 'ACTIVE'`
-          )
-          .run(holderId);
-      }
-    };
-
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeConvert);
-    } else {
-      executeConvert();
     }
   }
 
@@ -753,54 +443,22 @@ export class MsiInventoryService {
     holderId: string,
     slices: readonly ShipmentSlice[]
   ): void {
-    const executeRevert = () => {
-      for (const slice of slices) {
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_allocated = MAX(0, quantity_allocated - ?),
-                   quantity_reserved = quantity_reserved + ?
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(
-              slice.quantityAllocated,
-              slice.quantityAllocated,
-              slice.warehouseId,
-              slice.variantId
-            );
-        }
-        const memSlot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+    for (const slice of slices) {
+      const memSlot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (memSlot) {
+        memSlot.quantityAllocated = Math.max(
+          0,
+          memSlot.quantityAllocated - slice.quantityAllocated
         );
-        if (memSlot) {
-          memSlot.quantityAllocated = Math.max(
-            0,
-            memSlot.quantityAllocated - slice.quantityAllocated
-          );
-          memSlot.quantityReserved += slice.quantityAllocated;
-        }
+        memSlot.quantityReserved += slice.quantityAllocated;
       }
-      for (const r of this.activeReservations.values()) {
-        if (r.holderId === holderId && r.status === "CONVERTED_TO_ALLOCATION") {
-          r.status = "ACTIVE";
-        }
+    }
+    for (const r of this.activeReservations.values()) {
+      if (r.holderId === holderId && r.status === "CONVERTED_TO_ALLOCATION") {
+        r.status = "ACTIVE";
       }
-      if (this.sqlEngine) {
-        this.sqlEngine.db
-          .prepare(
-            `UPDATE stock_reservations
-             SET status = 'ACTIVE'
-             WHERE holder_id = ? AND status = 'CONVERTED_TO_ALLOCATION'`
-          )
-          .run(holderId);
-      }
-    };
-
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeRevert);
-    } else {
-      executeRevert();
     }
   }
 
@@ -809,87 +467,25 @@ export class MsiInventoryService {
    * (e.g. when a supervisor rejects the PO or the reservation expires).
    */
   releaseReservation(holderId: string, slices: readonly ShipmentSlice[]): void {
-    const executeRelease = () => {
-      for (const slice of slices) {
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_reserved = MAX(0, quantity_reserved - ?)
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(slice.quantityAllocated, slice.warehouseId, slice.variantId);
-        }
-        const memSlot = this.slots.find(
-          (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+    for (const slice of slices) {
+      const memSlot = this.slots.find(
+        (s) => s.warehouseId === slice.warehouseId && s.variantId === slice.variantId
+      );
+      if (memSlot) {
+        memSlot.quantityReserved = Math.max(
+          0,
+          memSlot.quantityReserved - slice.quantityAllocated
         );
-        if (memSlot) {
-          memSlot.quantityReserved = Math.max(
-            0,
-            memSlot.quantityReserved - slice.quantityAllocated
-          );
-        }
       }
-      for (const r of this.activeReservations.values()) {
-        if (r.holderId === holderId && r.status === "ACTIVE") {
-          r.status = "RELEASED";
-        }
+    }
+    for (const r of this.activeReservations.values()) {
+      if (r.holderId === holderId && r.status === "ACTIVE") {
+        r.status = "RELEASED";
       }
-      if (this.sqlEngine) {
-        this.sqlEngine.db
-          .prepare(
-            `UPDATE stock_reservations
-             SET status = 'RELEASED'
-             WHERE holder_id = ? AND status = 'ACTIVE'`
-          )
-          .run(holderId);
-      }
-    };
-
-    if (this.sqlEngine) {
-      this.sqlEngine.inTransaction(executeRelease);
-    } else {
-      executeRelease();
     }
   }
 
   listReservations(statusFilter?: StockReservationStatus): StockReservationRecord[] {
-    if (this.sqlEngine) {
-      const sql = statusFilter
-        ? `SELECT reservation_id, holder_id, warehouse_id, variant_id, line_id, quantity, status, ttl_seconds, expires_at, created_at
-           FROM stock_reservations WHERE status = ? ORDER BY expires_at ASC`
-        : `SELECT reservation_id, holder_id, warehouse_id, variant_id, line_id, quantity, status, ttl_seconds, expires_at, created_at
-           FROM stock_reservations ORDER BY expires_at ASC`;
-      const rows = (
-        statusFilter ? this.sqlEngine.db.prepare(sql).all(statusFilter) : this.sqlEngine.db.prepare(sql).all()
-      ) as {
-        reservation_id: string;
-        holder_id: string;
-        warehouse_id: string;
-        variant_id: string;
-        line_id: string;
-        quantity: number;
-        status: StockReservationStatus;
-        ttl_seconds: number;
-        expires_at: string;
-        created_at: string;
-      }[];
-      if (rows.length > 0 || statusFilter !== undefined) {
-        return rows.map((r) => ({
-          reservationId: r.reservation_id,
-          holderId: r.holder_id,
-          warehouseId: r.warehouse_id,
-          variantId: r.variant_id,
-          lineId: r.line_id,
-          quantity: r.quantity,
-          status: r.status,
-          ttlSeconds: r.ttl_seconds,
-          expiresAt: r.expires_at,
-          createdAt: r.created_at,
-        }));
-      }
-    }
-
     return Array.from(this.activeReservations.values())
       .filter((r) => !statusFilter || r.status === statusFilter)
       .sort((a, b) => a.expiresAt.localeCompare(b.expiresAt))
@@ -897,8 +493,8 @@ export class MsiInventoryService {
   }
 
   /**
-   * Deterministically reaps expired `ACTIVE` MSI stock reservations (`expires_at <= nowMs`)
-   * in an atomic transaction, releasing `quantity_reserved` back into the `Available` pool.
+   * Deterministically reaps expired `ACTIVE` MSI stock reservations (`expires_at <= nowMs`),
+   * releasing `quantity_reserved` back into the `Available` pool.
    */
   reapExpiredReservations(
     nowMs = Date.now(),
@@ -908,115 +504,44 @@ export class MsiInventoryService {
     const reapedAtIso = new Date(nowMs).toISOString();
     const limit = options?.limit ?? 500;
 
-    const executeReap = (): Omit<ReapReservationsResult, "latencyUs"> => {
-      const entries: ReapedReservationEntry[] = [];
-      const expiredHolders = new Set<string>();
-      let totalUnitsReleased = 0;
+    const entries: ReapedReservationEntry[] = [];
+    const expiredHolders = new Set<string>();
+    let totalUnitsReleased = 0;
 
-      if (this.sqlEngine) {
-        const candidates = this.sqlEngine.db
-          .prepare(
-            `SELECT reservation_id, holder_id, warehouse_id, variant_id, quantity, expires_at
-             FROM stock_reservations
-             WHERE status = 'ACTIVE' AND expires_at <= ?
-             ORDER BY expires_at ASC
-             LIMIT ?`
-          )
-          .all(reapedAtIso, limit) as {
-          reservation_id: string;
-          holder_id: string;
-          warehouse_id: string;
-          variant_id: string;
-          quantity: number;
-          expires_at: string;
-        }[];
+    const candidates = Array.from(this.activeReservations.values())
+      .filter((r) => r.status === "ACTIVE" && Date.parse(r.expiresAt) <= nowMs)
+      .sort((a, b) => a.expiresAt.localeCompare(b.expiresAt))
+      .slice(0, limit);
 
-        for (const row of candidates) {
-          const markExpired = this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_reservations
-               SET status = 'EXPIRED'
-               WHERE reservation_id = ? AND status = 'ACTIVE'`
-            )
-            .run(row.reservation_id);
-
-          if (Number(markExpired.changes) !== 1) continue;
-
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE stock_quants
-               SET quantity_reserved = MAX(0, quantity_reserved - ?)
-               WHERE warehouse_id = ? AND variant_id = ?`
-            )
-            .run(row.quantity, row.warehouse_id, row.variant_id);
-
-          const memSlot = this.slots.find(
-            (s) => s.warehouseId === row.warehouse_id && s.variantId === row.variant_id
-          );
-          if (memSlot) {
-            memSlot.quantityReserved = Math.max(0, memSlot.quantityReserved - row.quantity);
-          }
-
-          const memRes = this.activeReservations.get(row.reservation_id);
-          if (memRes) {
-            memRes.status = "EXPIRED";
-          }
-
-          totalUnitsReleased += row.quantity;
-          expiredHolders.add(row.holder_id);
-          entries.push({
-            reservationId: row.reservation_id,
-            holderId: row.holder_id,
-            warehouseId: row.warehouse_id,
-            variantId: row.variant_id,
-            quantityReleased: row.quantity,
-            expiredAt: row.expires_at,
-          });
-        }
-      } else {
-        const candidates = Array.from(this.activeReservations.values())
-          .filter((r) => r.status === "ACTIVE" && Date.parse(r.expiresAt) <= nowMs)
-          .sort((a, b) => a.expiresAt.localeCompare(b.expiresAt))
-          .slice(0, limit);
-
-        for (const res of candidates) {
-          if (res.status !== "ACTIVE") continue;
-          res.status = "EXPIRED";
-          const memSlot = this.slots.find(
-            (s) => s.warehouseId === res.warehouseId && s.variantId === res.variantId
-          );
-          if (memSlot) {
-            memSlot.quantityReserved = Math.max(0, memSlot.quantityReserved - res.quantity);
-          }
-          totalUnitsReleased += res.quantity;
-          expiredHolders.add(res.holderId);
-          entries.push({
-            reservationId: res.reservationId,
-            holderId: res.holderId,
-            warehouseId: res.warehouseId,
-            variantId: res.variantId,
-            quantityReleased: res.quantity,
-            expiredAt: res.expiresAt,
-          });
-        }
+    for (const res of candidates) {
+      if (res.status !== "ACTIVE") continue;
+      res.status = "EXPIRED";
+      const memSlot = this.slots.find(
+        (s) => s.warehouseId === res.warehouseId && s.variantId === res.variantId
+      );
+      if (memSlot) {
+        memSlot.quantityReserved = Math.max(0, memSlot.quantityReserved - res.quantity);
       }
+      totalUnitsReleased += res.quantity;
+      expiredHolders.add(res.holderId);
+      entries.push({
+        reservationId: res.reservationId,
+        holderId: res.holderId,
+        warehouseId: res.warehouseId,
+        variantId: res.variantId,
+        quantityReleased: res.quantity,
+        expiredAt: res.expiresAt,
+      });
+    }
 
-      return {
-        reapedAtIso,
-        reapedReservationCount: entries.length,
-        totalUnitsReleased,
-        expiredHolderIds: Array.from(expiredHolders),
-        entries,
-      };
-    };
-
-    const result = this.sqlEngine
-      ? this.sqlEngine.inTransaction(executeReap)
-      : executeReap();
     const latencyUs =
       Math.round((Number(process.hrtime.bigint() - t0) / 1_000) * 100) / 100;
     return {
-      ...result,
+      reapedAtIso,
+      reapedReservationCount: entries.length,
+      totalUnitsReleased,
+      expiredHolderIds: Array.from(expiredHolders),
+      entries,
       latencyUs,
     };
   }

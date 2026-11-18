@@ -16,7 +16,6 @@ import {
 } from "@super-ecommerce/kernel";
 import {
   serializeWithBigInt,
-  SqlDatabaseEngine,
   type AllocationStrategy,
   type PgPoolLike,
   type StockAvailabilityMode,
@@ -102,7 +101,6 @@ export interface CheckoutWorkflowDeps {
   readonly storeCreditLedger?: StoreCreditLedger;
   readonly orderStore?: Map<string, OrderRecord>;
   readonly pgPool?: PgPoolLike;
-  readonly sqlEngine?: SqlDatabaseEngine;
 }
 
 export function buildCompleteCheckoutWorkflow(deps: CheckoutWorkflowDeps) {
@@ -270,37 +268,8 @@ export function buildCompleteCheckoutWorkflow(deps: CheckoutWorkflowDeps) {
         });
         deps.orderStore?.set(orderId, order);
       } else {
-        const commitAction = () => {
-          if (deps.sqlEngine) {
-            deps.sqlEngine.db
-              .prepare(
-                `INSERT INTO orders (
-                   order_id, checkout_id, channel_slug, customer_id,
-                   currency_code, total_gross_amount, payment_status,
-                   payment_transaction_id, payload_json, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, 'CAPTURED', ?, ?, ?)`
-              )
-              .run(
-                orderId,
-                order.checkoutId,
-                order.channelSlug,
-                order.customerId ?? null,
-                order.currencyCode,
-                order.pricing.totalGrossAmount.toString(),
-                order.paymentTransactionId ?? null,
-                serializeWithBigInt(order),
-                order.createdAt
-              );
-          }
-          deps.orderStore?.set(orderId, order);
-          deps.outboxService.enqueue(outboxEventParams);
-        };
-
-        if (deps.sqlEngine) {
-          deps.sqlEngine.inTransaction(commitAction);
-        } else {
-          commitAction();
-        }
+        deps.orderStore?.set(orderId, order);
+        await deps.outboxService.enqueue(outboxEventParams);
       }
 
       return order;

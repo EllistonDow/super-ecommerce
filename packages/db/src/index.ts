@@ -5,7 +5,6 @@ export * from "./pg-wire-driver.ts";
 export * from "./pg-pool.ts";
 export * from "./migrator.ts";
 export * from "./offline-pg.ts";
-export * from "./sql-persistence.ts";
 export * from "./pg-container-bootstrap.ts";
 export * from "./saleor-live-projector.ts";
 export * from "./hybrid-search.ts";

@@ -14,6 +14,7 @@
     "configurator": "node --experimental-strip-types packages/configurator/src/cli.ts",
     "test:rust": "cargo test --workspace",
     "test:ts": "node --experimental-strip-types --test packages/kernel/src/kernel.test.ts packages/db/src/db.test.ts packages/workflow/src/workflow.test.ts packages/core/src/core.test.ts packages/plugin-sdk/src/plugin-sdk.test.ts packages/configurator/src/configurator.test.ts packages/mcp-server/src/mcp-server.test.ts apps/api/src/api.test.ts apps/storefront/src/storefront.test.ts apps/admin/src/admin.test.ts",
+    "test:pg-live": "node --experimental-strip-types --test packages/core/src/pg-live.integration.test.ts apps/api/src/pg-live-http.integration.test.ts",
     "test": "npm run test:rust && npm run test:ts"
   },
   "engines": {

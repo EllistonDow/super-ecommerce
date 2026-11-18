@@ -12,8 +12,8 @@
  * 3. Replay Attack Protection:
  *    Rejects webhook deliveries whose signed `t` timestamp differs from current server time
  *    by more than `toleranceSeconds` (default `300` seconds / 5 minutes).
- * 4. ACID SQL Idempotency & State Reconciliation:
- *    Inside a single `sqlEngine.inTransaction(...)` block:
+ * 4. ACID PostgreSQL Idempotency & State Reconciliation (`PgStripeWebhookService`):
+ *    Inside a single `pool.withTransaction(...)` block:
  *    - Deduplicates by `event_id` in `inbound_webhook_events` (`PRIMARY KEY (event_id)`)
  *    - Updates `orders.payment_status` (`CAPTURED`, `REFUNDED`, `DISPUTED`, `FAILED`)
  *    - On `payment_intent.payment_failed`, automatically compensates allocated MSI warehouse
@@ -25,7 +25,6 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   deserializeWithBigInt,
   serializeWithBigInt,
-  SqlDatabaseEngine,
   type PgPoolLike,
 } from "@super-ecommerce/db";
 import type { MinorUnits } from "@super-ecommerce/kernel";
@@ -248,7 +247,6 @@ export interface StripeWebhookProcessResult {
 export class StripeWebhookService {
   private readonly endpointSecrets: readonly string[];
   private readonly toleranceSeconds: number;
-  private readonly sqlEngine?: SqlDatabaseEngine;
   private readonly inventoryService: MsiInventoryService;
   private readonly outboxService: TransactionalOutboxService;
   private readonly orderStore: Map<string, OrderRecord>;
@@ -257,7 +255,6 @@ export class StripeWebhookService {
   constructor(params: {
     endpointSecrets: string | readonly string[];
     toleranceSeconds?: number;
-    sqlEngine?: SqlDatabaseEngine;
     inventoryService: MsiInventoryService;
     outboxService: TransactionalOutboxService;
     orderStore: Map<string, OrderRecord>;
@@ -267,15 +264,13 @@ export class StripeWebhookService {
         ? [params.endpointSecrets]
         : params.endpointSecrets;
     this.toleranceSeconds = params.toleranceSeconds ?? 300;
-    this.sqlEngine = params.sqlEngine;
     this.inventoryService = params.inventoryService;
     this.outboxService = params.outboxService;
     this.orderStore = params.orderStore;
   }
 
   /**
-   * Verifies `Stripe-Signature` over `rawBody` and atomically applies the event
-   * inside a single ACID SQL transaction.
+   * Verifies `Stripe-Signature` over `rawBody` and applies the event idempotently in memory.
    */
   handleRawWebhook(params: {
     rawBody: string;
@@ -290,218 +285,6 @@ export class StripeWebhookService {
       nowSeconds: params.nowSeconds,
     });
 
-    const executeReconciliation = (): StripeWebhookProcessResult => {
-      const metadata = event.data.object.metadata ?? {};
-      const orderId =
-        metadata.orderId ??
-        (metadata.checkoutId ? `ord_${metadata.checkoutId}` : undefined);
-      const checkoutId = metadata.checkoutId;
-      const amountMinor = BigInt(Math.max(0, Math.trunc(event.data.object.amount)));
-
-      // 1. Idempotency check in SQL `inbound_webhook_events` or in-memory map
-      if (this.sqlEngine) {
-        const existing = this.sqlEngine.db
-          .prepare(
-            "SELECT event_id FROM inbound_webhook_events WHERE event_id = ?"
-          )
-          .get(event.id) as { event_id: string } | undefined;
-
-        if (existing) {
-          return {
-            eventId: event.id,
-            eventType: event.type,
-            duplicate: true,
-            orderId,
-            releasedWarehouseSlices: 0,
-          };
-        }
-      } else if (this.processedInMemory.has(event.id)) {
-        return {
-          eventId: event.id,
-          eventType: event.type,
-          duplicate: true,
-          orderId,
-          releasedWarehouseSlices: 0,
-        };
-      }
-
-      // 2. Map Stripe event type to target OrderPaymentStatus + Outbox event
-      let targetStatus: OrderPaymentStatus = "CAPTURED";
-      let outboxEventType = "payment.webhook.received";
-
-      switch (event.type) {
-        case "payment_intent.succeeded":
-          targetStatus = "CAPTURED";
-          outboxEventType = "payment.captured";
-          break;
-        case "payment_intent.payment_failed":
-          targetStatus = "FAILED";
-          outboxEventType = "payment.failed";
-          break;
-        case "charge.refunded":
-          targetStatus = "REFUNDED";
-          outboxEventType = "payment.refunded";
-          break;
-        case "charge.dispute.created":
-          targetStatus = "DISPUTED";
-          outboxEventType = "payment.disputed";
-          break;
-      }
-
-      // 3. Locate order in SQL or memory, update payment_status, and compensate MSI stock if payment failed
-      let releasedWarehouseSlices = 0;
-      let targetOrder: OrderRecord | undefined = orderId
-        ? this.orderStore.get(orderId)
-        : undefined;
-
-      if (!targetOrder && orderId && this.sqlEngine) {
-        const row = this.sqlEngine.db
-          .prepare("SELECT payload_json FROM orders WHERE order_id = ?")
-          .get(orderId) as { payload_json: string } | undefined;
-        if (row) {
-          targetOrder = deserializeWithBigInt<OrderRecord>(row.payload_json);
-        }
-      }
-
-      if (targetOrder && orderId) {
-        const updatedOrder: OrderRecord = {
-          ...targetOrder,
-          paymentStatus: targetStatus,
-          paymentTransactionId: event.data.object.id,
-        };
-        this.orderStore.set(orderId, updatedOrder);
-
-        if (this.sqlEngine) {
-          this.sqlEngine.db
-            .prepare(
-              `UPDATE orders
-               SET payment_status = ?,
-                   payment_transaction_id = ?,
-                   payload_json = ?
-               WHERE order_id = ?`
-            )
-            .run(
-              targetStatus,
-              event.data.object.id,
-              serializeWithBigInt(updatedOrder),
-              orderId
-            );
-        }
-
-        // If asynchronous payment failed, release MSI stock allocations back to available pool
-        if (
-          event.type === "payment_intent.payment_failed" &&
-          targetOrder.shipments.length > 0
-        ) {
-          this.inventoryService.releaseAllocations(targetOrder.shipments);
-          releasedWarehouseSlices = targetOrder.shipments.length;
-        }
-      }
-
-      // 4. Record webhook event in `inbound_webhook_events`
-      const nowIso = new Date().toISOString();
-      const auditRecord: InboundWebhookAuditRecord = {
-        eventId: event.id,
-        provider: "stripe",
-        eventType: event.type,
-        signatureTimestamp: event.created,
-        orderId,
-        checkoutId,
-        amountMinorUnits: amountMinor,
-        processedAt: nowIso,
-      };
-      this.processedInMemory.set(event.id, auditRecord);
-
-      if (this.sqlEngine) {
-        this.sqlEngine.db
-          .prepare(
-            `INSERT INTO inbound_webhook_events (
-               event_id, provider, event_type, signature_timestamp,
-               order_id, checkout_id, amount_minor_units, payload_json, processed_at
-             ) VALUES (?, 'stripe', ?, ?, ?, ?, ?, ?, ?)`
-          )
-          .run(
-            event.id,
-            event.type,
-            event.created,
-            orderId ?? null,
-            checkoutId ?? null,
-            amountMinor.toString(),
-            params.rawBody,
-            nowIso
-          );
-      }
-
-      // 5. Enqueue Transactional Outbox event in the same SQL transaction
-      this.outboxService.enqueue({
-        eventType: outboxEventType,
-        aggregateType: "Order",
-        aggregateId: orderId ?? event.data.object.id,
-        channelSlug: metadata.channelSlug ?? targetOrder?.channelSlug,
-        payload: {
-          stripeEventId: event.id,
-          stripeObjectId: event.data.object.id,
-          orderId: orderId ?? null,
-          paymentStatus: targetStatus,
-          amountMinorUnits: amountMinor.toString(),
-          releasedWarehouseSlices,
-        },
-      });
-
-      return {
-        eventId: event.id,
-        eventType: event.type,
-        duplicate: false,
-        orderId,
-        updatedPaymentStatus: targetStatus,
-        releasedWarehouseSlices,
-      };
-    };
-
-    // Note: if `inventoryService.releaseAllocations` is called when `this.sqlEngine` is active,
-    // avoid nested `BEGIN IMMEDIATE` by executing the outer transaction around SQL statements
-    if (this.sqlEngine) {
-      return this.sqlEngine.inTransaction(() => {
-        return this.executeReconciliationWithNestedSafeInventory(
-          event,
-          params.rawBody
-        );
-      });
-    }
-
-    return executeReconciliation();
-  }
-
-  private executeReconciliationWithInventoryInTx(
-    shipments: OrderRecord["shipments"]
-  ): void {
-    for (const slice of shipments) {
-      if (this.sqlEngine) {
-        this.sqlEngine.db
-          .prepare(
-            `UPDATE stock_quants
-             SET quantity_allocated = MAX(0, quantity_allocated - ?)
-             WHERE warehouse_id = ? AND variant_id = ?`
-          )
-          .run(slice.quantityAllocated, slice.warehouseId, slice.variantId);
-      }
-      const memSlot = this.inventoryService.getSlot(
-        slice.warehouseId,
-        slice.variantId
-      );
-      if (memSlot) {
-        memSlot.quantityAllocated = Math.max(
-          0,
-          memSlot.quantityAllocated - slice.quantityAllocated
-        );
-      }
-    }
-  }
-
-  private executeReconciliationWithNestedSafeInventory(
-    event: StripeWebhookEventPayload,
-    rawBody: string
-  ): StripeWebhookProcessResult {
     const metadata = event.data.object.metadata ?? {};
     const orderId =
       metadata.orderId ??
@@ -509,11 +292,7 @@ export class StripeWebhookService {
     const checkoutId = metadata.checkoutId;
     const amountMinor = BigInt(Math.max(0, Math.trunc(event.data.object.amount)));
 
-    const existing = this.sqlEngine!.db
-      .prepare("SELECT event_id FROM inbound_webhook_events WHERE event_id = ?")
-      .get(event.id) as { event_id: string } | undefined;
-
-    if (existing) {
+    if (this.processedInMemory.has(event.id)) {
       return {
         eventId: event.id,
         eventType: event.type,
@@ -546,18 +325,9 @@ export class StripeWebhookService {
     }
 
     let releasedWarehouseSlices = 0;
-    let targetOrder: OrderRecord | undefined = orderId
+    const targetOrder: OrderRecord | undefined = orderId
       ? this.orderStore.get(orderId)
       : undefined;
-
-    if (!targetOrder && orderId) {
-      const row = this.sqlEngine!.db
-        .prepare("SELECT payload_json FROM orders WHERE order_id = ?")
-        .get(orderId) as { payload_json: string } | undefined;
-      if (row) {
-        targetOrder = deserializeWithBigInt<OrderRecord>(row.payload_json);
-      }
-    }
 
     if (targetOrder && orderId) {
       const updatedOrder: OrderRecord = {
@@ -567,26 +337,11 @@ export class StripeWebhookService {
       };
       this.orderStore.set(orderId, updatedOrder);
 
-      this.sqlEngine!.db
-        .prepare(
-          `UPDATE orders
-           SET payment_status = ?,
-               payment_transaction_id = ?,
-               payload_json = ?
-           WHERE order_id = ?`
-        )
-        .run(
-          targetStatus,
-          event.data.object.id,
-          serializeWithBigInt(updatedOrder),
-          orderId
-        );
-
       if (
         event.type === "payment_intent.payment_failed" &&
         targetOrder.shipments.length > 0
       ) {
-        this.executeReconciliationWithInventoryInTx(targetOrder.shipments);
+        this.inventoryService.releaseAllocations(targetOrder.shipments);
         releasedWarehouseSlices = targetOrder.shipments.length;
       }
     }
@@ -603,24 +358,6 @@ export class StripeWebhookService {
       processedAt: nowIso,
     };
     this.processedInMemory.set(event.id, auditRecord);
-
-    this.sqlEngine!.db
-      .prepare(
-        `INSERT INTO inbound_webhook_events (
-           event_id, provider, event_type, signature_timestamp,
-           order_id, checkout_id, amount_minor_units, payload_json, processed_at
-         ) VALUES (?, 'stripe', ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        event.id,
-        event.type,
-        event.created,
-        orderId ?? null,
-        checkoutId ?? null,
-        amountMinor.toString(),
-        rawBody,
-        nowIso
-      );
 
     this.outboxService.enqueue({
       eventType: outboxEventType,
@@ -648,37 +385,6 @@ export class StripeWebhookService {
   }
 
   listProcessedEvents(): readonly InboundWebhookAuditRecord[] {
-    if (this.sqlEngine) {
-      const rows = this.sqlEngine.db
-        .prepare(
-          `SELECT event_id, provider, event_type, signature_timestamp,
-                  order_id, checkout_id, amount_minor_units, processed_at
-           FROM inbound_webhook_events
-           ORDER BY processed_at DESC`
-        )
-        .all() as {
-        event_id: string;
-        provider: string;
-        event_type: StripeWebhookEventType;
-        signature_timestamp: number;
-        order_id: string | null;
-        checkout_id: string | null;
-        amount_minor_units: string;
-        processed_at: string;
-      }[];
-
-      return rows.map((r) => ({
-        eventId: r.event_id,
-        provider: r.provider,
-        eventType: r.event_type,
-        signatureTimestamp: r.signature_timestamp,
-        orderId: r.order_id ?? undefined,
-        checkoutId: r.checkout_id ?? undefined,
-        amountMinorUnits: BigInt(r.amount_minor_units),
-        processedAt: r.processed_at,
-      }));
-    }
-
     return Array.from(this.processedInMemory.values());
   }
 }

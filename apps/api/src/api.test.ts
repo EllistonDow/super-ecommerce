@@ -1309,4 +1309,20 @@ describe("Multi-route Merchant Backoffice", () => {
     assert.equal(settingsHtml.includes("—"), false);
     assert.equal(settingsHtml.includes("–"), false);
   });
+
+  it("exposes GET /healthz with database mode probe for container readiness checks", async () => {
+    const testApp = createAppRequestHandler({ pgPool: new OfflinePgPool() });
+    const res = await testApp(new Request("http://localhost/healthz"));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      status: string;
+      database: string;
+      pgVersion: string | null;
+      timestamp: string;
+    };
+    assert.equal(body.status, "ok");
+    assert.equal(body.database, "offline");
+    assert.equal(body.pgVersion, null);
+    assert.ok(Date.parse(body.timestamp) > 0);
+  });
 });

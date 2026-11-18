@@ -1,0 +1,22 @@
+# Version control & editor metadata
+.git
+.github
+.claude
+.vscode
+.idea
+.DS_Store
+
+# Build artifacts & local dependencies (rebuilt cleanly inside container)
+node_modules
+target
+packages/kernel/native/commerce_kernel.node
+
+# Local logs, temporary artifacts & env files
+*.log
+*.tmp
+.env
+.env.*
+docs
+README.md
+docker-compose.yml
+Dockerfile

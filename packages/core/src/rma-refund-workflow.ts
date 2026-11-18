@@ -25,7 +25,6 @@ import {
 import {
   deserializeWithBigInt,
   serializeWithBigInt,
-  SqlDatabaseEngine,
   type PgPoolLike,
 } from "@super-ecommerce/db";
 import { createStep, createWorkflow } from "@super-ecommerce/workflow";
@@ -82,7 +81,6 @@ export interface RmaWorkflowDeps {
   readonly orderStore?: Map<string, OrderRecord>;
   readonly rmaStore?: Map<string, OrderReturnRecord>;
   readonly pgPool?: PgPoolLike;
-  readonly sqlEngine?: SqlDatabaseEngine;
 }
 
 interface VerifiedRmaPlan {
@@ -466,47 +464,9 @@ export function buildProcessReturnRefundWorkflow(deps: RmaWorkflowDeps) {
         deps.orderStore?.set(updatedOrder.orderId, updatedOrder);
         deps.rmaStore?.set(rmaRecord.rmaId, rmaRecord);
       } else {
-        const commitAction = () => {
-          if (deps.sqlEngine) {
-            deps.sqlEngine.db
-              .prepare(
-                `UPDATE orders
-                 SET payment_status = ?, payload_json = ?
-                 WHERE order_id = ?`
-              )
-              .run(nextStatus, serializeWithBigInt(updatedOrder), updatedOrder.orderId);
-
-            deps.sqlEngine.db
-              .prepare(
-                `INSERT INTO order_returns (
-                   rma_id, order_id, channel_slug, currency_code,
-                   total_refund_gross_amount, payment_gateway_refund_amount,
-                   store_credit_refund_amount, payload_json, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-              )
-              .run(
-                rmaRecord.rmaId,
-                rmaRecord.orderId,
-                rmaRecord.channelSlug,
-                rmaRecord.currencyCode,
-                rmaRecord.calculation.totalRefundGrossAmount.toString(),
-                rmaRecord.calculation.paymentGatewayRefundAmount.toString(),
-                rmaRecord.calculation.storeCreditRefundAmount.toString(),
-                serializeWithBigInt(rmaRecord),
-                rmaRecord.createdAt
-              );
-          }
-
-          deps.orderStore?.set(updatedOrder.orderId, updatedOrder);
-          deps.rmaStore?.set(rmaRecord.rmaId, rmaRecord);
-          deps.outboxService.enqueue(outboxEventParams);
-        };
-
-        if (deps.sqlEngine) {
-          deps.sqlEngine.inTransaction(commitAction);
-        } else {
-          commitAction();
-        }
+        deps.orderStore?.set(updatedOrder.orderId, updatedOrder);
+        deps.rmaStore?.set(rmaRecord.rmaId, rmaRecord);
+        await deps.outboxService.enqueue(outboxEventParams);
       }
 
       return rmaRecord;

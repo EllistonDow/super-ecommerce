@@ -223,7 +223,7 @@ export function renderAdminShellHtml(params: {
   const pgConnected = Boolean(input.pgContainerStatus?.connected);
   const pgSummary = pgConnected
     ? `${input.pgContainerStatus!.containerName} (${input.pgContainerStatus!.tableCount} tbl)`
-    : input.pgContainerStatus ? "SQLite Local" : "Not checked";
+    : input.pgContainerStatus ? "PG Offline" : "Not checked";
 
   const roleTone =
     activePrincipal.role === "SUPER_ADMIN"

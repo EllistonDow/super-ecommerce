@@ -16,7 +16,6 @@ import { randomUUID } from "node:crypto";
 import {
   deserializeWithBigInt,
   serializeWithBigInt,
-  SqlDatabaseEngine,
   type PgPoolLike,
   type PgQueryable,
   type PgTxClient,
@@ -62,46 +61,9 @@ export interface OutboxEventRecord<TPayload = unknown> {
   readonly createdAt: string;
 }
 
-interface SqlOutboxRow {
-  id: string;
-  event_type: string;
-  aggregate_type: string;
-  aggregate_id: string;
-  channel_slug: string | null;
-  payload_json: string;
-  status: OutboxEventStatus;
-  attempts: number;
-  next_attempt_at: string;
-  last_error: string | null;
-  delivered_at: string | null;
-  created_at: string;
-}
-
 export class TransactionalOutboxService {
   private readonly events: OutboxEventRecord[] = [];
-  private readonly sqlEngine?: SqlDatabaseEngine;
   private seq = 1;
-
-  constructor(sqlEngine?: SqlDatabaseEngine) {
-    this.sqlEngine = sqlEngine;
-  }
-
-  private hydrateRow(r: SqlOutboxRow): OutboxEventRecord {
-    return {
-      id: r.id,
-      eventType: r.event_type,
-      aggregateType: r.aggregate_type,
-      aggregateId: r.aggregate_id,
-      channelSlug: r.channel_slug ?? undefined,
-      payload: deserializeWithBigInt(r.payload_json),
-      status: r.status,
-      attempts: r.attempts,
-      nextAttemptAt: r.next_attempt_at,
-      lastError: r.last_error ?? undefined,
-      deliveredAt: r.delivered_at ?? undefined,
-      createdAt: r.created_at,
-    };
-  }
 
   enqueue<TPayload>(params: {
     eventType: string;
@@ -125,63 +87,15 @@ export class TransactionalOutboxService {
       createdAt: nowIso,
     };
 
-    if (this.sqlEngine) {
-      this.sqlEngine.db
-        .prepare(
-          `INSERT INTO transactional_outbox_events (
-             id, event_type, aggregate_type, aggregate_id, channel_slug,
-             payload_json, status, attempts, next_attempt_at, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)`
-        )
-        .run(
-          record.id,
-          record.eventType,
-          record.aggregateType,
-          record.aggregateId,
-          record.channelSlug ?? null,
-          serializeWithBigInt(record.payload),
-          record.nextAttemptAt,
-          record.createdAt
-        );
-    }
-
     this.events.push(record);
     return record;
   }
 
   listPending(): readonly OutboxEventRecord[] {
-    if (this.sqlEngine) {
-      const rows = this.sqlEngine.db
-        .prepare(
-          `SELECT id, event_type, aggregate_type, aggregate_id, channel_slug,
-                  payload_json, status, attempts, next_attempt_at, last_error, delivered_at, created_at
-           FROM transactional_outbox_events
-           WHERE status = 'PENDING'
-           ORDER BY created_at ASC`
-        )
-        .all() as unknown as SqlOutboxRow[];
-
-      return rows.map((r) => this.hydrateRow(r));
-    }
-
     return this.events.filter((e) => e.status === "PENDING");
   }
 
   listAll(limit = 50): readonly OutboxEventRecord[] {
-    if (this.sqlEngine) {
-      const rows = this.sqlEngine.db
-        .prepare(
-          `SELECT id, event_type, aggregate_type, aggregate_id, channel_slug,
-                  payload_json, status, attempts, next_attempt_at, last_error, delivered_at, created_at
-           FROM transactional_outbox_events
-           ORDER BY created_at DESC
-           LIMIT ?`
-        )
-        .all(limit) as unknown as SqlOutboxRow[];
-
-      return rows.map((r) => this.hydrateRow(r));
-    }
-
     return [...this.events].reverse().slice(0, limit);
   }
 
@@ -195,21 +109,6 @@ export class TransactionalOutboxService {
     const nowIso = params?.nowIso ?? new Date().toISOString();
     const batchSize = params?.batchSize ?? 25;
 
-    if (this.sqlEngine) {
-      const rows = this.sqlEngine.db
-        .prepare(
-          `SELECT id, event_type, aggregate_type, aggregate_id, channel_slug,
-                  payload_json, status, attempts, next_attempt_at, last_error, delivered_at, created_at
-           FROM transactional_outbox_events
-           WHERE status = 'PENDING' AND next_attempt_at <= ?
-           ORDER BY created_at ASC
-           LIMIT ?`
-        )
-        .all(nowIso, batchSize) as unknown as SqlOutboxRow[];
-
-      return rows.map((r) => this.hydrateRow(r));
-    }
-
     return this.events
       .filter((e) => e.status === "PENDING" && e.nextAttemptAt <= nowIso)
       .slice(0, batchSize);
@@ -217,18 +116,6 @@ export class TransactionalOutboxService {
 
   markPublished(eventId: string, nowIso?: string): void {
     const deliveredAt = nowIso ?? new Date().toISOString();
-    if (this.sqlEngine) {
-      this.sqlEngine.db
-        .prepare(
-          `UPDATE transactional_outbox_events
-           SET status = 'PUBLISHED',
-               attempts = attempts + 1,
-               delivered_at = ?,
-               last_error = NULL
-           WHERE id = ?`
-        )
-        .run(deliveredAt, eventId);
-    }
     const evt = this.events.find((e) => e.id === eventId);
     if (evt) {
       evt.status = "PUBLISHED";
@@ -252,41 +139,13 @@ export class TransactionalOutboxService {
     const nowMs = params.nowMs ?? Date.now();
     const memEvt = this.events.find((e) => e.id === params.eventId);
 
-    let currentAttempts = memEvt?.attempts ?? 0;
-    if (this.sqlEngine) {
-      const row = this.sqlEngine.db
-        .prepare("SELECT attempts FROM transactional_outbox_events WHERE id = ?")
-        .get(params.eventId) as { attempts: number } | undefined;
-      if (row) {
-        currentAttempts = row.attempts;
-      }
-    }
-
+    const currentAttempts = memEvt?.attempts ?? 0;
     const nextAttempts = currentAttempts + 1;
     const nextStatus: OutboxEventStatus =
       nextAttempts >= params.maxAttempts ? "DEAD_LETTER" : "PENDING";
     const backoffMs =
       params.baseDelayMs * Math.pow(2, Math.max(0, nextAttempts - 1));
     const nextAttemptAt = new Date(nowMs + backoffMs).toISOString();
-
-    if (this.sqlEngine) {
-      this.sqlEngine.db
-        .prepare(
-          `UPDATE transactional_outbox_events
-           SET status = ?,
-               attempts = ?,
-               next_attempt_at = ?,
-               last_error = ?
-           WHERE id = ?`
-        )
-        .run(
-          nextStatus,
-          nextAttempts,
-          nextAttemptAt,
-          params.errorMessage,
-          params.eventId
-        );
-    }
 
     if (memEvt) {
       memEvt.status = nextStatus;
@@ -306,35 +165,13 @@ export class TransactionalOutboxService {
     const resetTime = nowIso ?? new Date().toISOString();
     let count = 0;
 
-    if (this.sqlEngine) {
-      if (eventId) {
-        const res = this.sqlEngine.db
-          .prepare(
-            `UPDATE transactional_outbox_events
-             SET status = 'PENDING', attempts = 0, next_attempt_at = ?, last_error = NULL
-             WHERE id = ? AND status = 'DEAD_LETTER'`
-          )
-          .run(resetTime, eventId);
-        count = Number(res.changes);
-      } else {
-        const res = this.sqlEngine.db
-          .prepare(
-            `UPDATE transactional_outbox_events
-             SET status = 'PENDING', attempts = 0, next_attempt_at = ?, last_error = NULL
-             WHERE status = 'DEAD_LETTER'`
-          )
-          .run(resetTime);
-        count = Number(res.changes);
-      }
-    }
-
     for (const evt of this.events) {
       if (evt.status === "DEAD_LETTER" && (!eventId || evt.id === eventId)) {
         evt.status = "PENDING";
         evt.attempts = 0;
         evt.nextAttemptAt = resetTime;
         evt.lastError = undefined;
-        if (!this.sqlEngine) count += 1;
+        count += 1;
       }
     }
 

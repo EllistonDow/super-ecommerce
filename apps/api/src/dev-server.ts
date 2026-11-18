@@ -457,12 +457,12 @@ const inventoryService = new MsiInventoryService(INITIAL_STOCK_SLOTS);
 const outboxService = new TransactionalOutboxService();
 const orderStore = new Map<string, OrderRecord>();
 const rmaStore = new Map<string, OrderReturnRecord>();
-const workflowStore = new PgWorkflowStateStore(defaultDevServerPgPool);
+const defaultWorkflowStore = new PgWorkflowStateStore(defaultDevServerPgPool);
 const b2bService = new B2bOrganizationService({
   inventoryService,
   outboxService,
   orderStore,
-  workflowStateStore: workflowStore,
+  workflowStateStore: defaultWorkflowStore,
 });
 const reservationReaper = new ReservationTtlReaperService({
   inventoryService,
@@ -1034,6 +1034,9 @@ function inputBoolean(body: Record<string, unknown>, key: string): boolean {
 
 export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
   const pgPool = options.pgPool ?? defaultDevServerPgPool;
+  const workflowStore = options.pgPool
+    ? new PgWorkflowStateStore(pgPool)
+    : defaultWorkflowStore;
   const ordersRepo = new PgOrdersRepository(pgPool);
   const customersService = new PgCustomersService(pgPool);
   const pgAdminAuthRbac = new PgAdminAuthRbacService(pgPool);
@@ -1585,6 +1588,26 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
     try {
     const url = new URL(req.url);
     await ensureReady();
+
+    if (req.method === "GET" && url.pathname === "/healthz") {
+      const isLivePg = pgPool instanceof PgPool;
+      let pgVersion: string | null = null;
+      if (isLivePg) {
+        const probe = await pgPool.query<{ server_version: string }>(
+          "SELECT current_setting('server_version') AS server_version"
+        );
+        pgVersion = probe.rows[0]?.server_version ?? null;
+      } else {
+        await pgPool.query("SELECT 1 AS ok");
+      }
+      return jsonResponse({
+        status: "ok",
+        database: isLivePg ? "postgres" : "offline",
+        pgVersion,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     if (req.method === "POST") {
       const permission = protectedActions[url.pathname] ?? (
         /^\/api\/admin\/orders\/[^/]+\/rma$/.test(url.pathname) ? "saga:execute_checkout" :
@@ -4748,6 +4771,7 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const port = Number(process.env["PORT"] ?? 4100);
+  const host = process.env["HOST"] ?? "127.0.0.1";
   const handler = createAppRequestHandler();
 
   const server = createServer(async (nodeReq, nodeRes) => {
@@ -4805,7 +4829,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
   });
 
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`Super Ecommerce full-stack server listening on http://localhost:${port}`);
+  server.listen(port, host, () => {
+    console.log(`Super Ecommerce full-stack server listening on http://${host}:${port}`);
   });
 }

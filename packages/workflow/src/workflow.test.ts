@@ -5,9 +5,8 @@ import {
   createWorkflow,
   InMemoryWorkflowStateStore,
   PgWorkflowStateStore,
-  SqlWorkflowStateStore,
 } from "./index.ts";
-import { OfflinePgPool, runMigrations, SqlDatabaseEngine } from "@super-ecommerce/db";
+import { OfflinePgPool, runMigrations } from "@super-ecommerce/db";
 
 describe("@super-ecommerce/workflow", () => {
   it("compensates completed steps in strict LIFO reverse order when a downstream step fails", async () => {
@@ -121,10 +120,11 @@ describe("@super-ecommerce/workflow", () => {
     assert.equal(resumed.output?.paymentIntentId, "pi_999");
   });
 
-  it("persists workflow runs and step logs in SQL tables (SqlWorkflowStateStore) with BigInt fidelity", async () => {
-    const sqlEngine = new SqlDatabaseEngine(":memory:");
+  it("persists workflow runs and step logs in PostgreSQL tables (PgWorkflowStateStore) with BigInt fidelity", async () => {
+    const pg = new OfflinePgPool();
+    await runMigrations(pg);
     try {
-      const sqlStore = new SqlWorkflowStateStore(sqlEngine);
+      const pgStore = new PgWorkflowStateStore(pg);
       let step1Invocations = 0;
 
       const step1 = createStep({
@@ -135,29 +135,28 @@ describe("@super-ecommerce/workflow", () => {
         },
       });
 
-      const wf = createWorkflow("sql-durable-wf", async (amount: bigint, ctx) => {
+      const wf = createWorkflow("pg-durable-wf", async (amount: bigint, ctx) => {
         return await ctx.run(step1, amount);
       });
 
       const first = await wf.execute(42_500n, {
-        idempotencyKey: "sql-idem-1",
-        store: sqlStore,
+        idempotencyKey: "pg-idem-1",
+        store: pgStore,
       });
       assert.equal(first.status, "COMPLETED");
       assert.equal(first.output?.lockedMinorUnits, 42_500n);
       assert.equal(step1Invocations, 1);
 
-      // Re-running with the same idempotencyKey reads directly from SQL workflow_runs + workflow_step_logs
       const second = await wf.execute(42_500n, {
-        idempotencyKey: "sql-idem-1",
-        store: sqlStore,
+        idempotencyKey: "pg-idem-1",
+        store: pgStore,
       });
       assert.equal(second.status, "COMPLETED");
       assert.equal(second.output?.lockedMinorUnits, 42_500n);
       assert.equal(step1Invocations, 1);
       assert.deepEqual(second.replayedSteps, ["lock-funds"]);
     } finally {
-      sqlEngine.close();
+      await pg.close();
     }
   });
 

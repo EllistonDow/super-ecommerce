@@ -24,7 +24,6 @@ import {
 import {
   deserializeWithBigInt,
   serializeWithBigInt,
-  SqlDatabaseEngine,
   type AllocationStrategy,
   type PgPoolLike,
   type PgQueryable,
@@ -150,7 +149,6 @@ export interface B2bServiceDeps {
   readonly inventoryService: MsiInventoryService;
   readonly outboxService: TransactionalOutboxService;
   readonly orderStore: Map<string, OrderRecord>;
-  readonly sqlEngine?: SqlDatabaseEngine;
   readonly workflowStateStore?: WorkflowStateStore;
 }
 
@@ -251,90 +249,14 @@ export class B2bOrganizationService {
 
   upsertCompany(company: B2bCompanyRecord): void {
     this.companies.set(company.companyId, { ...company });
-    if (this.deps.sqlEngine) {
-      this.deps.sqlEngine.db
-        .prepare(
-          `INSERT INTO b2b_companies (
-             company_id, name, tax_id, tax_exempt_verified, payment_terms,
-             currency_code, credit_limit, credit_used, credit_reserved,
-             contract_discount_bps, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (company_id) DO UPDATE SET
-             name = excluded.name,
-             tax_exempt_verified = excluded.tax_exempt_verified,
-             payment_terms = excluded.payment_terms,
-             credit_limit = excluded.credit_limit,
-             credit_used = excluded.credit_used,
-             credit_reserved = excluded.credit_reserved,
-             contract_discount_bps = excluded.contract_discount_bps`
-        )
-        .run(
-          company.companyId,
-          company.name,
-          company.taxId,
-          company.taxExemptVerified ? 1 : 0,
-          company.paymentTerms,
-          company.currencyCode,
-          company.creditLimit.toString(),
-          company.creditUsed.toString(),
-          company.creditReserved.toString(),
-          company.contractDiscountBps,
-          company.createdAt
-        );
-    }
   }
 
   upsertCostCenter(cc: B2bCostCenterRecord): void {
     this.costCenters.set(cc.costCenterId, { ...cc });
-    if (this.deps.sqlEngine) {
-      this.deps.sqlEngine.db
-        .prepare(
-          `INSERT INTO b2b_cost_centers (
-             cost_center_id, company_id, name, department_code,
-             monthly_budget, monthly_spent, monthly_reserved, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (cost_center_id) DO UPDATE SET
-             monthly_budget = excluded.monthly_budget,
-             monthly_spent = excluded.monthly_spent,
-             monthly_reserved = excluded.monthly_reserved`
-        )
-        .run(
-          cc.costCenterId,
-          cc.companyId,
-          cc.name,
-          cc.departmentCode,
-          cc.monthlyBudget.toString(),
-          cc.monthlySpent.toString(),
-          cc.monthlyReserved.toString(),
-          cc.createdAt
-        );
-    }
   }
 
   upsertBuyerMember(member: B2bBuyerMemberRecord): void {
     this.buyers.set(member.buyerId, { ...member });
-    if (this.deps.sqlEngine) {
-      this.deps.sqlEngine.db
-        .prepare(
-          `INSERT INTO b2b_buyer_members (
-             buyer_id, company_id, cost_center_id, email, full_name,
-             role, single_order_auto_approve_limit, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (buyer_id) DO UPDATE SET
-             role = excluded.role,
-             single_order_auto_approve_limit = excluded.single_order_auto_approve_limit`
-        )
-        .run(
-          member.buyerId,
-          member.companyId,
-          member.costCenterId,
-          member.email,
-          member.fullName,
-          member.role,
-          member.singleOrderAutoApproveLimit.toString(),
-          member.createdAt
-        );
-    }
   }
 
   getCompany(companyId: string): B2bCompanyRecord | undefined {
@@ -378,18 +300,6 @@ export class B2bOrganizationService {
   }
 
   listPurchaseOrders(limit = 20): B2bPurchaseOrderRecord[] {
-    if (this.deps.sqlEngine) {
-      const rows = this.deps.sqlEngine.db
-        .prepare(
-          `SELECT payload_json FROM b2b_purchase_orders ORDER BY created_at DESC LIMIT ?`
-        )
-        .all(limit) as { payload_json: string }[];
-      if (rows.length > 0) {
-        return rows.map((r) =>
-          deserializeWithBigInt<B2bPurchaseOrderRecord>(r.payload_json)
-        );
-      }
-    }
     return Array.from(this.purchaseOrders.values())
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, limit)
@@ -398,42 +308,6 @@ export class B2bOrganizationService {
 
   private persistPurchaseOrder(po: B2bPurchaseOrderRecord): void {
     this.purchaseOrders.set(po.poId, { ...po });
-    if (this.deps.sqlEngine) {
-      this.deps.sqlEngine.db
-        .prepare(
-          `INSERT INTO b2b_purchase_orders (
-             po_id, po_number, company_id, cost_center_id, buyer_id,
-             approver_id, order_id, status, currency_code, total_gross_amount,
-             tax_exempt_savings_amount, net_terms_due_days, reservation_ttl_seconds,
-             reservation_expires_at, payload_json, created_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (po_id) DO UPDATE SET
-             approver_id = excluded.approver_id,
-             order_id = excluded.order_id,
-             status = excluded.status,
-             payload_json = excluded.payload_json,
-             updated_at = excluded.updated_at`
-        )
-        .run(
-          po.poId,
-          po.poNumber,
-          po.companyId,
-          po.costCenterId,
-          po.buyerId,
-          po.approverId ?? null,
-          po.orderId ?? null,
-          po.status,
-          po.pricing.currencyCode,
-          po.pricing.totalGrossAmount.toString(),
-          po.taxExemptSavingsAmount.toString(),
-          po.netTermsDueDays,
-          po.reservationTtlSeconds,
-          po.reservationExpiresAt ?? null,
-          serializeWithBigInt(po),
-          po.createdAt,
-          po.updatedAt
-        );
-    }
   }
 
   private adjustCreditAndBudget(params: {
@@ -461,32 +335,6 @@ export class B2bOrganizationService {
     company.creditReserved = nextCreditReserved < 0n ? 0n : nextCreditReserved;
     cc.monthlySpent = nextMonthlySpent < 0n ? 0n : nextMonthlySpent;
     cc.monthlyReserved = nextMonthlyReserved < 0n ? 0n : nextMonthlyReserved;
-
-    if (this.deps.sqlEngine) {
-      this.deps.sqlEngine.db
-        .prepare(
-          `UPDATE b2b_companies
-           SET credit_used = ?, credit_reserved = ?
-           WHERE company_id = ?`
-        )
-        .run(
-          company.creditUsed.toString(),
-          company.creditReserved.toString(),
-          company.companyId
-        );
-
-      this.deps.sqlEngine.db
-        .prepare(
-          `UPDATE b2b_cost_centers
-           SET monthly_spent = ?, monthly_reserved = ?
-           WHERE cost_center_id = ?`
-        )
-        .run(
-          cc.monthlySpent.toString(),
-          cc.monthlyReserved.toString(),
-          cc.costCenterId
-        );
-    }
   }
 
   /**
@@ -765,52 +613,23 @@ export class B2bOrganizationService {
           updatedAt: nowIso,
         };
 
-        const persistFn = () => {
-          if (this.deps.sqlEngine) {
-            this.deps.sqlEngine.db
-              .prepare(
-                `INSERT INTO orders (
-                   order_id, checkout_id, channel_slug, customer_id,
-                   currency_code, total_gross_amount, payment_status,
-                   payment_transaction_id, payload_json, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, 'AUTHORIZED', ?, ?, ?)`
-              )
-              .run(
-                orderId,
-                order.checkoutId,
-                order.channelSlug,
-                order.customerId ?? null,
-                order.currencyCode,
-                order.pricing.totalGrossAmount.toString(),
-                order.paymentTransactionId ?? null,
-                serializeWithBigInt(order),
-                order.createdAt
-              );
-          }
-          this.deps.orderStore.set(orderId, order);
-          this.persistPurchaseOrder(approvedPo);
-          this.deps.outboxService.enqueue({
-            eventType: "b2b.po.approved_auto.v1",
-            aggregateType: "B2bPurchaseOrder",
-            aggregateId: approvedPo.poId,
-            channelSlug: input.channelSlug,
-            payload: {
-              poId: approvedPo.poId,
-              poNumber: approvedPo.poNumber,
-              orderId,
-              totalGrossAmount: policyEvaluation.pricing.totalGrossAmount.toString(),
-              taxExemptSavingsAmount:
-                policyEvaluation.taxExemptSavingsAmount.toString(),
-              netTermsDueDays: policyEvaluation.netTermsDueDays,
-            },
-          });
-        };
-
-        if (this.deps.sqlEngine) {
-          this.deps.sqlEngine.inTransaction(persistFn);
-        } else {
-          persistFn();
-        }
+        this.deps.orderStore.set(orderId, order);
+        this.persistPurchaseOrder(approvedPo);
+        this.deps.outboxService.enqueue({
+          eventType: "b2b.po.approved_auto.v1",
+          aggregateType: "B2bPurchaseOrder",
+          aggregateId: approvedPo.poId,
+          channelSlug: input.channelSlug,
+          payload: {
+            poId: approvedPo.poId,
+            poNumber: approvedPo.poNumber,
+            orderId,
+            totalGrossAmount: policyEvaluation.pricing.totalGrossAmount.toString(),
+            taxExemptSavingsAmount:
+              policyEvaluation.taxExemptSavingsAmount.toString(),
+            netTermsDueDays: policyEvaluation.netTermsDueDays,
+          },
+        });
 
         return { order, po: approvedPo };
       },
@@ -1004,50 +823,21 @@ export class B2bOrganizationService {
           updatedAt: nowIso,
         };
 
-        const persistFn = () => {
-          if (this.deps.sqlEngine) {
-            this.deps.sqlEngine.db
-              .prepare(
-                `INSERT INTO orders (
-                   order_id, checkout_id, channel_slug, customer_id,
-                   currency_code, total_gross_amount, payment_status,
-                   payment_transaction_id, payload_json, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, 'AUTHORIZED', ?, ?, ?)`
-              )
-              .run(
-                orderId,
-                order.checkoutId,
-                order.channelSlug,
-                order.customerId ?? null,
-                order.currencyCode,
-                order.pricing.totalGrossAmount.toString(),
-                order.paymentTransactionId ?? null,
-                serializeWithBigInt(order),
-                order.createdAt
-              );
-          }
-          this.deps.orderStore.set(orderId, order);
-          this.persistPurchaseOrder(approvedPo);
-          this.deps.outboxService.enqueue({
-            eventType: "b2b.po.approved_by_supervisor.v1",
-            aggregateType: "B2bPurchaseOrder",
-            aggregateId: approvedPo.poId,
-            channelSlug: po.channelSlug,
-            payload: {
-              poId: approvedPo.poId,
-              poNumber: approvedPo.poNumber,
-              orderId,
-              approverId: approver.buyerId,
-              totalGrossAmount: gross.toString(),
-            },
-          });
-        };
-
-        if (this.deps.sqlEngine) {
-          this.deps.sqlEngine.inTransaction(persistFn);
-        } else {
-          persistFn();
-        }
+        this.deps.orderStore.set(orderId, order);
+        this.persistPurchaseOrder(approvedPo);
+        this.deps.outboxService.enqueue({
+          eventType: "b2b.po.approved_by_supervisor.v1",
+          aggregateType: "B2bPurchaseOrder",
+          aggregateId: approvedPo.poId,
+          channelSlug: po.channelSlug,
+          payload: {
+            poId: approvedPo.poId,
+            poNumber: approvedPo.poNumber,
+            orderId,
+            approverId: approver.buyerId,
+            totalGrossAmount: gross.toString(),
+          },
+        });
 
         return { po: approvedPo, order };
       },

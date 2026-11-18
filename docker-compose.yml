@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: super-ecommerce-postgres17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SUPER_PG_USER:-super}
+      POSTGRES_PASSWORD: ${SUPER_PG_PASSWORD:-superpassword}
+      POSTGRES_DB: ${SUPER_PG_DB:-super_ecommerce}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${SUPER_PG_HOST_PORT:-5438}:5432"
+    volumes:
+      - pg17_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SUPER_PG_USER:-super} -d ${SUPER_PG_DB:-super_ecommerce}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-ecommerce-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4100
+      SUPER_PG_USE_WIRE: "1"
+      SUPER_PG_HOST: postgres
+      SUPER_PG_PORT: "5432"
+      SUPER_PG_USER: ${SUPER_PG_USER:-super}
+      SUPER_PG_PASSWORD: ${SUPER_PG_PASSWORD:-superpassword}
+      SUPER_PG_DB: ${SUPER_PG_DB:-super_ecommerce}
+    ports:
+      - "${PORT:-4100}:4100"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4100/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  pg17_data:

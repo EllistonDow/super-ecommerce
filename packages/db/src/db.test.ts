@@ -14,7 +14,6 @@ import {
   PgWireClient,
   runMigrations,
   serializeWithBigInt,
-  SqlDatabaseEngine,
   validateDynamicAttributes,
 } from "./index.ts";
 import type { AttributeDefinition, CatalogChannelProjectionRecord, ChannelRecord } from "./index.ts";
@@ -198,34 +197,36 @@ describe("@super-ecommerce/db", () => {
     await client.close();
   });
 
-  it("enforces ACID SQL transactions and CHECK constraints in SqlDatabaseEngine", () => {
-    const sqlEngine = new SqlDatabaseEngine(":memory:");
+  it("enforces ACID PostgreSQL transactions and CHECK constraints in OfflinePgPool", async () => {
+    const pgPool = new OfflinePgPool();
+    await runMigrations(pgPool);
     try {
-      sqlEngine.inTransaction(() => {
-        sqlEngine.db
-          .prepare(
-            `INSERT INTO stock_quants (warehouse_id, priority_rank, linked_to_channel, supports_shipping_zone, variant_id, quantity_on_hand, quantity_reserved, quantity_allocated)
-             VALUES (?, ?, 1, 1, ?, ?, 0, 0)`
-          )
-          .run("wh-1", 10, "var-1", 25);
+      await pgPool.withTransaction(async (tx) => {
+        await tx.query(
+          `INSERT INTO msi_stock_slots (warehouse_id, priority_rank, linked_to_channel, supports_shipping_zone, variant_id, quantity_on_hand, quantity_reserved, quantity_allocated)
+           VALUES ($1, $2, true, true, $3, $4, 0, 0)`,
+          ["wh-1", 10, "var-1", 25]
+        );
       });
 
       // Violating CHECK (quantity_reserved >= 0) inside a transaction rolls back atomically
-      assert.throws(() => {
-        sqlEngine.inTransaction(() => {
-          sqlEngine.db
-            .prepare(`UPDATE stock_quants SET quantity_reserved = -5 WHERE warehouse_id = ?`)
-            .run("wh-1");
+      await assert.rejects(async () => {
+        await pgPool.withTransaction(async (tx) => {
+          await tx.query(
+            `UPDATE msi_stock_slots SET quantity_reserved = -5 WHERE warehouse_id = $1 AND variant_id = $2`,
+            ["wh-1", "var-1"]
+          );
         });
       });
 
-      const row = sqlEngine.db
-        .prepare(`SELECT quantity_on_hand, quantity_reserved FROM stock_quants WHERE warehouse_id = ?`)
-        .get("wh-1") as { quantity_on_hand: number; quantity_reserved: number };
-      assert.equal(row.quantity_on_hand, 25);
-      assert.equal(row.quantity_reserved, 0);
+      const res = await pgPool.query<{ quantity_on_hand: string; quantity_reserved: string }>(
+        `SELECT quantity_on_hand, quantity_reserved FROM msi_stock_slots WHERE warehouse_id = $1`,
+        ["wh-1"]
+      );
+      assert.equal(Number(res.rows[0]?.quantity_on_hand), 25);
+      assert.equal(Number(res.rows[0]?.quantity_reserved), 0);
     } finally {
-      sqlEngine.close();
+      await pgPool.close();
     }
   });
 

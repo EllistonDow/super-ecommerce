@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { OfflinePgPool, runMigrations, SqlDatabaseEngine } from "@super-ecommerce/db";
-import { InMemoryWorkflowStateStore, PgWorkflowStateStore, SqlWorkflowStateStore } from "@super-ecommerce/workflow";
+import { OfflinePgPool, runMigrations } from "@super-ecommerce/db";
+import { InMemoryWorkflowStateStore, PgWorkflowStateStore } from "@super-ecommerce/workflow";
 import {
   AdminAuthRbacService,
   B2bOrganizationService,
@@ -31,8 +31,8 @@ import {
 } from "./index.ts";
 
 describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
-  function createTestHarness(options?: { shouldFailPayment?: boolean; useSql?: boolean }) {
-    const sqlEngine = options?.useSql ? new SqlDatabaseEngine(":memory:") : undefined;
+  function createTestHarness(options?: { shouldFailPayment?: boolean; pgPool?: OfflinePgPool }) {
+    const pgPool = options?.pgPool;
     const inventoryService = new MsiInventoryService([
       {
         warehouseId: "WH-EAST",
@@ -64,7 +64,7 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
         quantityReserved: 0,
         quantityAllocated: 0,
       },
-    ], sqlEngine);
+    ]);
 
     const creditBalances = new Map<string, bigint>([["cust-1", 2000n]]);
     const storeCreditLedger: StoreCreditLedger = {
@@ -100,34 +100,35 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
       },
     };
 
-    const outboxService = new TransactionalOutboxService(sqlEngine);
+    const outboxService = new TransactionalOutboxService();
+    const pgOutboxService = pgPool ? new PgTransactionalOutboxService(pgPool) : undefined;
     const orderStore = new Map<string, OrderRecord>();
     const rmaStore = new Map<string, OrderReturnRecord>();
-    const wfStore = sqlEngine
-      ? new SqlWorkflowStateStore(sqlEngine)
+    const wfStore = pgPool
+      ? new PgWorkflowStateStore(pgPool)
       : new InMemoryWorkflowStateStore();
 
     const workflow = buildCompleteCheckoutWorkflow({
       inventoryService,
       paymentGateway,
-      outboxService,
+      outboxService: pgOutboxService ?? outboxService,
       storeCreditLedger,
       orderStore,
-      sqlEngine,
+      pgPool,
     });
 
     const rmaWorkflow = buildProcessReturnRefundWorkflow({
       inventoryService,
       paymentGateway,
-      outboxService,
+      outboxService: pgOutboxService ?? outboxService,
       storeCreditLedger,
       orderStore,
       rmaStore,
-      sqlEngine,
+      pgPool,
     });
 
     return {
-      sqlEngine,
+      pgPool,
       inventoryService,
       creditBalances,
       capturedPayments,
@@ -258,7 +259,9 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
   });
 
   it("compensates 3 steps in LIFO order (capture-payment void -> redeem-store-credit restore -> allocate-inventory release) when Step 5 commit faults", async () => {
-    const h = createTestHarness({ useSql: true });
+    const pg = new OfflinePgPool();
+    await runMigrations(pg);
+    const h = createTestHarness({ pgPool: pg });
     try {
       const res = await h.workflow.execute(
         {
@@ -309,8 +312,8 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
       assert.equal(h.inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 0);
 
       // Persisted workflow run summary reflects COMPENSATED status and LIFO chain
-      const sqlStore = h.wfStore as SqlWorkflowStateStore;
-      const runs = sqlStore.listRecentRuns(5);
+      const pgWfStore = h.wfStore as PgWorkflowStateStore;
+      const runs = await pgWfStore.listRecentRuns(5);
       assert.equal(runs.length, 1);
       assert.equal(runs[0]?.status, "COMPENSATED");
       assert.deepEqual(runs[0]?.compensatedLifoChain, [
@@ -319,12 +322,14 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
         "allocate-inventory",
       ]);
     } finally {
-      h.sqlEngine?.close();
+      await pg.close();
     }
   });
 
-  it("executes completeCheckoutWorkflow backed by real ACID SQL tables (stock_quants, workflow_runs, orders, transactional_outbox_events)", async () => {
-    const h = createTestHarness({ useSql: true });
+  it("executes completeCheckoutWorkflow backed by PostgreSQL ACID tables (workflow_runs, orders, transactional_outbox_events)", async () => {
+    const pg = new OfflinePgPool();
+    await runMigrations(pg);
+    const h = createTestHarness({ pgPool: pg });
     try {
       const res = await h.workflow.execute(
         {
@@ -355,423 +360,410 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
       );
 
       assert.equal(res.status, "COMPLETED");
-      const orderRows = h.sqlEngine!.db
-        .prepare("SELECT order_id, total_gross_amount FROM orders WHERE order_id = ?")
-        .all("ord_chk-sql-777") as { order_id: string; total_gross_amount: string }[];
-      assert.equal(orderRows.length, 1);
-      assert.equal(orderRows[0]?.total_gross_amount, "4400");
+      const orderRows = await pg.query<{ id: string; total_gross_amount: string }>(
+        "SELECT id, total_gross_amount FROM orders WHERE id = $1",
+        ["ord_chk-sql-777"]
+      );
+      assert.equal(orderRows.rows.length, 1);
+      assert.equal(orderRows.rows[0]?.total_gross_amount, "4400");
 
-      const outboxRows = h.sqlEngine!.db
-        .prepare("SELECT event_type, status FROM transactional_outbox_events WHERE aggregate_id = ?")
-        .all("ord_chk-sql-777") as { event_type: string; status: string }[];
-      assert.equal(outboxRows.length, 1);
-      assert.equal(outboxRows[0]?.event_type, "order.created");
-      assert.equal(outboxRows[0]?.status, "PENDING");
+      const outboxRows = await pg.query<{ event_type: string; status: string }>(
+        "SELECT event_type, status FROM transactional_outbox_events WHERE aggregate_id = $1",
+        ["ord_chk-sql-777"]
+      );
+      assert.equal(outboxRows.rows.length, 1);
+      assert.equal(outboxRows.rows[0]?.event_type, "order.created");
+      assert.equal(outboxRows.rows[0]?.status, "PENDING");
     } finally {
-      h.sqlEngine?.close();
+      await pg.close();
     }
   });
 
   it("verifies Stripe v1 HMAC-SHA256 signatures in constant time, blocks replay/tampering, deduplicates retries, and compensates MSI stock on async failure", async () => {
-    const h = createTestHarness({ useSql: true });
-    try {
-      // 1. Complete an initial order in SQL
-      const checkoutRes = await h.workflow.execute(
-        {
-          checkoutId: "chk-wh-500",
-          channelSlug: "us-retail",
-          customerId: "cust-1",
-          stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
-          allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
-          paymentToken: "tok_async_3ds",
-          cart: {
-            currencyCode: "USD",
-            taxMode: "TAX_EXCLUSIVE",
-            shippingBaseAmount: 0n,
-            shippingTaxRateBps: 0,
-            lines: [
-              {
-                lineId: "L1",
-                variantId: "SKU-1",
-                quantity: 3,
-                baseUnitPrice: 2000n,
-                taxRateBps: 0,
-              },
-            ],
-          },
-        },
-        { idempotencyKey: "checkout-chk-wh-500", store: h.wfStore }
-      );
-      assert.equal(checkoutRes.status, "COMPLETED");
-      assert.equal(h.inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 3);
-
-      const webhookService = new StripeWebhookService({
-        endpointSecrets: ["whsec_active_2026_secret", "whsec_rollover_old_secret"],
-        toleranceSeconds: 300,
-        sqlEngine: h.sqlEngine,
-        inventoryService: h.inventoryService,
-        outboxService: h.outboxService,
-        orderStore: h.orderStore,
-      });
-
-      const nowSec = 1_763_000_000;
-      const failBody = JSON.stringify({
-        id: "evt_stripe_async_fail_01",
-        type: "payment_intent.payment_failed",
-        created: nowSec,
-        data: {
-          object: {
-            id: "pi_3ds_failed_01",
-            amount: 6000,
-            currency: "usd",
-            metadata: {
-              orderId: "ord_chk-wh-500",
-              checkoutId: "chk-wh-500",
-              channelSlug: "us-retail",
+    const h = createTestHarness();
+    // 1. Complete an initial order
+    const checkoutRes = await h.workflow.execute(
+      {
+        checkoutId: "chk-wh-500",
+        channelSlug: "us-retail",
+        customerId: "cust-1",
+        stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+        allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+        paymentToken: "tok_async_3ds",
+        cart: {
+          currencyCode: "USD",
+          taxMode: "TAX_EXCLUSIVE",
+          shippingBaseAmount: 0n,
+          shippingTaxRateBps: 0,
+          lines: [
+            {
+              lineId: "L1",
+              variantId: "SKU-1",
+              quantity: 3,
+              baseUnitPrice: 2000n,
+              taxRateBps: 0,
             },
-            failure_message: "3D Secure authentication declined by issuer",
-          },
+          ],
         },
-      });
+      },
+      { idempotencyKey: "checkout-chk-wh-500", store: h.wfStore }
+    );
+    assert.equal(checkoutRes.status, "COMPLETED");
+    assert.equal(h.inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 3);
 
-      // A. Reject tampered body signed with valid secret
-      const validHeader = signStripeWebhookPayload({
-        rawBody: failBody,
-        secret: "whsec_rollover_old_secret",
-        timestampSeconds: nowSec,
-      });
-      assert.throws(
-        () =>
-          webhookService.handleRawWebhook({
-            rawBody: failBody.replace("6000", "100"),
-            signatureHeader: validHeader,
-            nowSeconds: nowSec,
-          }),
-        (err: unknown) =>
-          err instanceof StripeWebhookVerificationError &&
-          err.code === "SIGNATURE_MISMATCH"
-      );
+    const webhookService = new StripeWebhookService({
+      endpointSecrets: ["whsec_active_2026_secret", "whsec_rollover_old_secret"],
+      toleranceSeconds: 300,
+      inventoryService: h.inventoryService,
+      outboxService: h.outboxService,
+      orderStore: h.orderStore,
+    });
 
-      // B. Reject replay attack outside 300s tolerance window
-      assert.throws(
-        () =>
-          webhookService.handleRawWebhook({
-            rawBody: failBody,
-            signatureHeader: validHeader,
-            nowSeconds: nowSec + 601,
-          }),
-        (err: unknown) =>
-          err instanceof StripeWebhookVerificationError &&
-          err.code === "TIMESTAMP_OUTSIDE_TOLERANCE"
-      );
+    const nowSec = 1_763_000_000;
+    const failBody = JSON.stringify({
+      id: "evt_stripe_async_fail_01",
+      type: "payment_intent.payment_failed",
+      created: nowSec,
+      data: {
+        object: {
+          id: "pi_3ds_failed_01",
+          amount: 6000,
+          currency: "usd",
+          metadata: {
+            orderId: "ord_chk-wh-500",
+            checkoutId: "chk-wh-500",
+            channelSlug: "us-retail",
+          },
+          failure_message: "3D Secure authentication declined by issuer",
+        },
+      },
+    });
 
-      // C. Process valid webhook signed with rollover secret -> marks order FAILED & releases 3 units of SKU-1
-      const processed = webhookService.handleRawWebhook({
-        rawBody: failBody,
-        signatureHeader: validHeader,
-        nowSeconds: nowSec + 10,
-      });
-      assert.equal(processed.duplicate, false);
-      assert.equal(processed.updatedPaymentStatus, "FAILED");
-      assert.equal(processed.releasedWarehouseSlices, 1);
-      assert.equal(h.inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 0);
+    // A. Reject tampered body signed with valid secret
+    const validHeader = signStripeWebhookPayload({
+      rawBody: failBody,
+      secret: "whsec_rollover_old_secret",
+      timestampSeconds: nowSec,
+    });
+    assert.throws(
+      () =>
+        webhookService.handleRawWebhook({
+          rawBody: failBody.replace("6000", "100"),
+          signatureHeader: validHeader,
+          nowSeconds: nowSec,
+        }),
+      (err: unknown) =>
+        err instanceof StripeWebhookVerificationError &&
+        err.code === "SIGNATURE_MISMATCH"
+    );
 
-      // D. Duplicate retry delivery of same `evt_stripe_async_fail_01` is idempotently ignored
-      const retry = webhookService.handleRawWebhook({
-        rawBody: failBody,
-        signatureHeader: validHeader,
-        nowSeconds: nowSec + 20,
-      });
-      assert.equal(retry.duplicate, true);
-      assert.equal(retry.releasedWarehouseSlices, 0);
-    } finally {
-      h.sqlEngine?.close();
-    }
+    // B. Reject replay attack outside 300s tolerance window
+    assert.throws(
+      () =>
+        webhookService.handleRawWebhook({
+          rawBody: failBody,
+          signatureHeader: validHeader,
+          nowSeconds: nowSec + 601,
+        }),
+      (err: unknown) =>
+        err instanceof StripeWebhookVerificationError &&
+        err.code === "TIMESTAMP_OUTSIDE_TOLERANCE"
+    );
+
+    // C. Process valid webhook signed with rollover secret -> marks order FAILED & releases 3 units of SKU-1
+    const processed = webhookService.handleRawWebhook({
+      rawBody: failBody,
+      signatureHeader: validHeader,
+      nowSeconds: nowSec + 10,
+    });
+    assert.equal(processed.duplicate, false);
+    assert.equal(processed.updatedPaymentStatus, "FAILED");
+    assert.equal(processed.releasedWarehouseSlices, 1);
+    assert.equal(h.inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 0);
+
+    // D. Duplicate retry delivery of same `evt_stripe_async_fail_01` is idempotently ignored
+    const retry = webhookService.handleRawWebhook({
+      rawBody: failBody,
+      signatureHeader: validHeader,
+      nowSeconds: nowSec + 20,
+    });
+    assert.equal(retry.duplicate, true);
+    assert.equal(retry.releasedWarehouseSlices, 0);
   });
 
   it("relays Outbox events with HMAC-SHA256 signatures, applies exponential backoff on failure, transitions to DEAD_LETTER, and replays on recovery", async () => {
-    const sqlEngine = new SqlDatabaseEngine(":memory:");
-    try {
-      const outbox = new TransactionalOutboxService(sqlEngine);
-      const t0 = 1_763_000_000_000;
+    const outbox = new TransactionalOutboxService();
+    const t0 = 1_763_000_000_000;
 
-      outbox.enqueue({
-        eventType: "order.created",
-        aggregateType: "Order",
-        aggregateId: "ord_1001",
-        payload: { orderId: "ord_1001", grossAmount: 25000n },
-        nowIso: new Date(t0).toISOString(),
-      });
+    outbox.enqueue({
+      eventType: "order.created",
+      aggregateType: "Order",
+      aggregateId: "ord_1001",
+      payload: { orderId: "ord_1001", grossAmount: 25000n },
+      nowIso: new Date(t0).toISOString(),
+    });
 
-      const poisonEvt = outbox.enqueue({
-        eventType: "erp.sync_invoice",
-        aggregateType: "Order",
-        aggregateId: "ord_1001",
-        payload: { invoiceCode: "INV-1001" },
-        nowIso: new Date(t0).toISOString(),
-      });
+    const poisonEvt = outbox.enqueue({
+      eventType: "erp.sync_invoice",
+      aggregateType: "Order",
+      aggregateId: "ord_1001",
+      payload: { invoiceCode: "INV-1001" },
+      nowIso: new Date(t0).toISOString(),
+    });
 
-      let erpShouldFail = true;
-      const verifiedSignatures: boolean[] = [];
+    let erpShouldFail = true;
+    const verifiedSignatures: boolean[] = [];
 
-      const worker = new OutboxRelayWorker({
-        outboxService: outbox,
-        signingSecret: "whsec_outbox_test_secret",
-        maxAttempts: 3,
-        baseDelayMs: 1_000,
-        subscribers: [
-          {
-            name: "search-indexer",
-            eventPattern: "order.*",
-            handle(envelope) {
-              verifiedSignatures.push(
-                verifyOutboundOutboxSignature({
-                  eventId: envelope.event.id,
-                  rawPayloadJson: envelope.rawPayloadJson,
-                  signatureHeader: envelope.headers["super-commerce-signature"],
-                  signingSecret: "whsec_outbox_test_secret",
-                })
-              );
-            },
+    const worker = new OutboxRelayWorker({
+      outboxService: outbox,
+      signingSecret: "whsec_outbox_test_secret",
+      maxAttempts: 3,
+      baseDelayMs: 1_000,
+      subscribers: [
+        {
+          name: "search-indexer",
+          eventPattern: "order.*",
+          handle(envelope) {
+            verifiedSignatures.push(
+              verifyOutboundOutboxSignature({
+                eventId: envelope.event.id,
+                rawPayloadJson: envelope.rawPayloadJson,
+                signatureHeader: envelope.headers["super-commerce-signature"],
+                signingSecret: "whsec_outbox_test_secret",
+              })
+            );
           },
-          {
-            name: "netsuite-erp-webhook",
-            eventPattern: "erp.*",
-            handle() {
-              if (erpShouldFail) {
-                throw new Error("ERP_503_GATEWAY_TIMEOUT");
-              }
-            },
-          },
-        ],
-      });
-
-      // Tick 1 at t0: `order.created` succeeds (PUBLISHED), `erp.sync_invoice` fails attempt 1 -> backoff +1000ms
-      const tick1 = await worker.drainBatch({ nowMs: t0 });
-      assert.equal(tick1.claimedCount, 2);
-      assert.equal(tick1.publishedCount, 1);
-      assert.equal(tick1.retriedCount, 1);
-      assert.equal(verifiedSignatures[0], true);
-
-      // Tick 1.5 at t0 + 500ms: `erp.sync_invoice` is not yet due (`next_attempt_at = t0 + 1000ms`)
-      const tickEarly = await worker.drainBatch({ nowMs: t0 + 500 });
-      assert.equal(tickEarly.claimedCount, 0);
-
-      // Tick 2 at t0 + 1000ms: fails attempt 2 -> backoff +2000ms (`t0 + 3000ms`)
-      const tick2 = await worker.drainBatch({ nowMs: t0 + 1_000 });
-      assert.equal(tick2.claimedCount, 1);
-      assert.equal(tick2.retriedCount, 1);
-
-      // Tick 3 at t0 + 3000ms: fails attempt 3 (maxAttempts=3) -> transitions to DEAD_LETTER!
-      const tick3 = await worker.drainBatch({ nowMs: t0 + 3_000 });
-      assert.equal(tick3.claimedCount, 1);
-      assert.equal(tick3.deadLetteredCount, 1);
-
-      const allAfterDlq = outbox.listAll();
-      const dlqRecord = allAfterDlq.find((e) => e.id === poisonEvt.id);
-      assert.equal(dlqRecord?.status, "DEAD_LETTER");
-      assert.equal(dlqRecord?.attempts, 3);
-      assert.equal(dlqRecord?.lastError, "ERP_503_GATEWAY_TIMEOUT");
-
-      // Recover ERP downstream & manually replay DEAD_LETTER queue
-      erpShouldFail = false;
-      const requeued = outbox.requeueDeadLetters(undefined, new Date(t0 + 4_000).toISOString());
-      assert.equal(requeued, 1);
-
-      const tick4 = await worker.drainBatch({ nowMs: t0 + 4_000 });
-      assert.equal(tick4.claimedCount, 1);
-      assert.equal(tick4.publishedCount, 1);
-
-      const finalRecord = outbox.listAll().find((e) => e.id === poisonEvt.id);
-      assert.equal(finalRecord?.status, "PUBLISHED");
-
-      // Also verify flaky 3PL self-healing (2 transient timeouts -> auto-heals on Attempt 3/3)
-      const flakyEvt = outbox.enqueue({
-        eventType: "fulfillment.3pl_dispatch_manifest",
-        aggregateType: "Shipment",
-        aggregateId: "shp_3001",
-        payload: { shipmentId: "shp_3001" },
-        nowIso: new Date(t0 + 5_000).toISOString(),
-      });
-      let flakyRemaining = 2;
-      worker.registerSubscriber({
-        name: "3pl-carrier",
-        eventPattern: "fulfillment.*",
-        handle() {
-          if (flakyRemaining > 0) {
-            flakyRemaining -= 1;
-            throw new Error("3PL_504_GATEWAY_TIMEOUT");
-          }
         },
-      });
+        {
+          name: "netsuite-erp-webhook",
+          eventPattern: "erp.*",
+          handle() {
+            if (erpShouldFail) {
+              throw new Error("ERP_503_GATEWAY_TIMEOUT");
+            }
+          },
+        },
+      ],
+    });
 
-      const f1 = await worker.drainBatch({ nowMs: t0 + 5_000 });
-      assert.equal(f1.retriedCount, 1);
-      const f2 = await worker.drainBatch({ nowMs: t0 + 6_000 });
-      assert.equal(f2.retriedCount, 1);
-      const f3 = await worker.drainBatch({ nowMs: t0 + 8_000 });
-      assert.equal(f3.publishedCount, 1);
+    // Tick 1 at t0: `order.created` succeeds (PUBLISHED), `erp.sync_invoice` fails attempt 1 -> backoff +1000ms
+    const tick1 = await worker.drainBatch({ nowMs: t0 });
+    assert.equal(tick1.claimedCount, 2);
+    assert.equal(tick1.publishedCount, 1);
+    assert.equal(tick1.retriedCount, 1);
+    assert.equal(verifiedSignatures[0], true);
 
-      const healedRecord = outbox.listAll().find((e) => e.id === flakyEvt.id);
-      assert.equal(healedRecord?.status, "PUBLISHED");
-      assert.equal(healedRecord?.attempts, 3);
+    // Tick 1.5 at t0 + 500ms: `erp.sync_invoice` is not yet due (`next_attempt_at = t0 + 1000ms`)
+    const tickEarly = await worker.drainBatch({ nowMs: t0 + 500 });
+    assert.equal(tickEarly.claimedCount, 0);
 
-      const stats = outbox.getStats();
-      assert.equal(stats.publishedCount, 3);
-      assert.equal(stats.deadLetterCount, 0);
-      assert.equal(stats.selfHealedCount, 1);
-    } finally {
-      sqlEngine.close();
-    }
+    // Tick 2 at t0 + 1000ms: fails attempt 2 -> backoff +2000ms (`t0 + 3000ms`)
+    const tick2 = await worker.drainBatch({ nowMs: t0 + 1_000 });
+    assert.equal(tick2.claimedCount, 1);
+    assert.equal(tick2.retriedCount, 1);
+
+    // Tick 3 at t0 + 3000ms: fails attempt 3 (maxAttempts=3) -> transitions to DEAD_LETTER!
+    const tick3 = await worker.drainBatch({ nowMs: t0 + 3_000 });
+    assert.equal(tick3.claimedCount, 1);
+    assert.equal(tick3.deadLetteredCount, 1);
+
+    const allAfterDlq = outbox.listAll();
+    const dlqRecord = allAfterDlq.find((e) => e.id === poisonEvt.id);
+    assert.equal(dlqRecord?.status, "DEAD_LETTER");
+    assert.equal(dlqRecord?.attempts, 3);
+    assert.equal(dlqRecord?.lastError, "ERP_503_GATEWAY_TIMEOUT");
+
+    // Recover ERP downstream & manually replay DEAD_LETTER queue
+    erpShouldFail = false;
+    const requeued = outbox.requeueDeadLetters(undefined, new Date(t0 + 4_000).toISOString());
+    assert.equal(requeued, 1);
+
+    const tick4 = await worker.drainBatch({ nowMs: t0 + 4_000 });
+    assert.equal(tick4.claimedCount, 1);
+    assert.equal(tick4.publishedCount, 1);
+
+    const finalRecord = outbox.listAll().find((e) => e.id === poisonEvt.id);
+    assert.equal(finalRecord?.status, "PUBLISHED");
+
+    // Also verify flaky 3PL self-healing (2 transient timeouts -> auto-heals on Attempt 3/3)
+    const flakyEvt = outbox.enqueue({
+      eventType: "fulfillment.3pl_dispatch_manifest",
+      aggregateType: "Shipment",
+      aggregateId: "shp_3001",
+      payload: { shipmentId: "shp_3001" },
+      nowIso: new Date(t0 + 5_000).toISOString(),
+    });
+    let flakyRemaining = 2;
+    worker.registerSubscriber({
+      name: "3pl-carrier",
+      eventPattern: "fulfillment.*",
+      handle() {
+        if (flakyRemaining > 0) {
+          flakyRemaining -= 1;
+          throw new Error("3PL_504_GATEWAY_TIMEOUT");
+        }
+      },
+    });
+
+    const f1 = await worker.drainBatch({ nowMs: t0 + 5_000 });
+    assert.equal(f1.retriedCount, 1);
+    const f2 = await worker.drainBatch({ nowMs: t0 + 6_000 });
+    assert.equal(f2.retriedCount, 1);
+    const f3 = await worker.drainBatch({ nowMs: t0 + 8_000 });
+    assert.equal(f3.publishedCount, 1);
+
+    const healedRecord = outbox.listAll().find((e) => e.id === flakyEvt.id);
+    assert.equal(healedRecord?.status, "PUBLISHED");
+    assert.equal(healedRecord?.attempts, 3);
+
+    const stats = outbox.getStats();
+    assert.equal(stats.publishedCount, 3);
+    assert.equal(stats.deadLetterCount, 0);
+    assert.equal(stats.selfHealedCount, 1);
   });
 
   it("executes single-hub split avoidance and 3-warehouse automatic order splitting on multi-warehouse Saleor SKUs", () => {
-    const sqlEngine = new SqlDatabaseEngine(":memory:");
-    try {
-      const msi = new MsiInventoryService([], sqlEngine);
-      msi.upsertExternalSlots([
-        // SKU A (01100730881488241020220001): Rank #1 has 978, Rank #2 has 987, Rank #3 has 100
-        {
-          warehouseId: "NTMS-DEFAULT-WARE",
-          priorityRank: 1,
-          linkedToChannel: true,
-          supportsShippingZone: true,
-          variantId: "01100730881488241020220001",
-          quantityOnHand: 978,
-          quantityReserved: 0,
-          quantityAllocated: 0,
-        },
-        {
-          warehouseId: "NTMS-HAWK-WAREHOU",
-          priorityRank: 2,
-          linkedToChannel: true,
-          supportsShippingZone: true,
-          variantId: "01100730881488241020220001",
-          quantityOnHand: 987,
-          quantityReserved: 0,
-          quantityAllocated: 0,
-        },
-        {
-          warehouseId: "NTMS-CANADA-WAREH",
-          priorityRank: 3,
-          linkedToChannel: true,
-          supportsShippingZone: true,
-          variantId: "01100730881488241020220001",
-          quantityOnHand: 100,
-          quantityReserved: 0,
-          quantityAllocated: 0,
-        },
-        // SKU B (012868878271 - 8oz BLAK Allegory Ink): Rank #1 has 433, Rank #2 has 100, Rank #3 has 100
-        {
-          warehouseId: "NTMS-DEFAULT-WARE",
-          priorityRank: 1,
-          linkedToChannel: true,
-          supportsShippingZone: true,
-          variantId: "012868878271",
-          quantityOnHand: 433,
-          quantityReserved: 0,
-          quantityAllocated: 0,
-        },
-        {
-          warehouseId: "NTMS-HAWK-WAREHOU",
-          priorityRank: 2,
-          linkedToChannel: true,
-          supportsShippingZone: true,
-          variantId: "012868878271",
-          quantityOnHand: 100,
-          quantityReserved: 0,
-          quantityAllocated: 0,
-        },
-        {
-          warehouseId: "NTMS-CANADA-WAREH",
-          priorityRank: 3,
-          linkedToChannel: true,
-          supportsShippingZone: true,
-          variantId: "012868878271",
-          quantityOnHand: 100,
-          quantityReserved: 0,
-          quantityAllocated: 0,
-        },
-      ]);
+    const msi = new MsiInventoryService([]);
+    msi.upsertExternalSlots([
+      // SKU A (01100730881488241020220001): Rank #1 has 978, Rank #2 has 987, Rank #3 has 100
+      {
+        warehouseId: "NTMS-DEFAULT-WARE",
+        priorityRank: 1,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "01100730881488241020220001",
+        quantityOnHand: 978,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+      {
+        warehouseId: "NTMS-HAWK-WAREHOU",
+        priorityRank: 2,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "01100730881488241020220001",
+        quantityOnHand: 987,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+      {
+        warehouseId: "NTMS-CANADA-WAREH",
+        priorityRank: 3,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "01100730881488241020220001",
+        quantityOnHand: 100,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+      // SKU B (012868878271 - 8oz BLAK Allegory Ink): Rank #1 has 433, Rank #2 has 100, Rank #3 has 100
+      {
+        warehouseId: "NTMS-DEFAULT-WARE",
+        priorityRank: 1,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "012868878271",
+        quantityOnHand: 433,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+      {
+        warehouseId: "NTMS-HAWK-WAREHOU",
+        priorityRank: 2,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "012868878271",
+        quantityOnHand: 100,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+      {
+        warehouseId: "NTMS-CANADA-WAREH",
+        priorityRank: 3,
+        linkedToChannel: true,
+        supportsShippingZone: true,
+        variantId: "012868878271",
+        quantityOnHand: 100,
+        quantityReserved: 0,
+        quantityAllocated: 0,
+      },
+    ]);
 
-      // 1. Single-Hub Split Avoidance: ordering 982 units of SKU A skips Rank #1 (978) and fulfills 100% from Rank #2 (987)
-      const singleHubPlan = msi.allocateForCheckout({
-        availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
-        strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
-        demands: [
-          {
-            lineId: "L-SINGLE-HUB",
-            variantId: "01100730881488241020220001",
-            quantity: 982,
-          },
-        ],
-      });
-      assert.equal(singleHubPlan.shipmentCount, 1);
-      assert.deepEqual(singleHubPlan.allocations, [
+    // 1. Single-Hub Split Avoidance: ordering 982 units of SKU A skips Rank #1 (978) and fulfills 100% from Rank #2 (987)
+    const singleHubPlan = msi.allocateForCheckout({
+      availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+      strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+      demands: [
         {
-          warehouseId: "NTMS-HAWK-WAREHOU",
           lineId: "L-SINGLE-HUB",
           variantId: "01100730881488241020220001",
-          quantityAllocated: 982,
+          quantity: 982,
         },
-      ]);
-      assert.equal(
-        msi.getSlot("NTMS-DEFAULT-WARE", "01100730881488241020220001")?.quantityAllocated,
-        0
-      );
-      assert.equal(
-        msi.getSlot("NTMS-HAWK-WAREHOU", "01100730881488241020220001")?.quantityAllocated,
-        982
-      );
+      ],
+    });
+    assert.equal(singleHubPlan.shipmentCount, 1);
+    assert.deepEqual(singleHubPlan.allocations, [
+      {
+        warehouseId: "NTMS-HAWK-WAREHOU",
+        lineId: "L-SINGLE-HUB",
+        variantId: "01100730881488241020220001",
+        quantityAllocated: 982,
+      },
+    ]);
+    assert.equal(
+      msi.getSlot("NTMS-DEFAULT-WARE", "01100730881488241020220001")?.quantityAllocated,
+      0
+    );
+    assert.equal(
+      msi.getSlot("NTMS-HAWK-WAREHOU", "01100730881488241020220001")?.quantityAllocated,
+      982
+    );
 
-      // 2. 3-Warehouse Automatic Split: ordering 550 units of SKU B splits across 433 + 100 + 17 = 550 (3 shipments)
-      const threeWhSplitPlan = msi.allocateForCheckout({
-        availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
-        strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
-        demands: [
-          {
-            lineId: "L-3WH-SPLIT",
-            variantId: "012868878271",
-            quantity: 550,
-          },
-        ],
-      });
-      assert.equal(threeWhSplitPlan.shipmentCount, 3);
-      assert.deepEqual(threeWhSplitPlan.allocations, [
+    // 2. 3-Warehouse Automatic Split: ordering 550 units of SKU B splits across 433 + 100 + 17 = 550 (3 shipments)
+    const threeWhSplitPlan = msi.allocateForCheckout({
+      availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+      strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+      demands: [
         {
-          warehouseId: "NTMS-DEFAULT-WARE",
           lineId: "L-3WH-SPLIT",
           variantId: "012868878271",
-          quantityAllocated: 433,
+          quantity: 550,
         },
-        {
-          warehouseId: "NTMS-HAWK-WAREHOU",
-          lineId: "L-3WH-SPLIT",
-          variantId: "012868878271",
-          quantityAllocated: 100,
-        },
-        {
-          warehouseId: "NTMS-CANADA-WAREH",
-          lineId: "L-3WH-SPLIT",
-          variantId: "012868878271",
-          quantityAllocated: 17,
-        },
-      ]);
-      assert.equal(
-        msi.getAvailableQuantity(msi.getSlot("NTMS-DEFAULT-WARE", "012868878271")!),
-        0
-      );
-      assert.equal(
-        msi.getAvailableQuantity(msi.getSlot("NTMS-HAWK-WAREHOU", "012868878271")!),
-        0
-      );
-      assert.equal(
-        msi.getAvailableQuantity(msi.getSlot("NTMS-CANADA-WAREH", "012868878271")!),
-        83
-      );
-    } finally {
-      sqlEngine.close();
-    }
+      ],
+    });
+    assert.equal(threeWhSplitPlan.shipmentCount, 3);
+    assert.deepEqual(threeWhSplitPlan.allocations, [
+      {
+        warehouseId: "NTMS-DEFAULT-WARE",
+        lineId: "L-3WH-SPLIT",
+        variantId: "012868878271",
+        quantityAllocated: 433,
+      },
+      {
+        warehouseId: "NTMS-HAWK-WAREHOU",
+        lineId: "L-3WH-SPLIT",
+        variantId: "012868878271",
+        quantityAllocated: 100,
+      },
+      {
+        warehouseId: "NTMS-CANADA-WAREH",
+        lineId: "L-3WH-SPLIT",
+        variantId: "012868878271",
+        quantityAllocated: 17,
+      },
+    ]);
+    assert.equal(
+      msi.getAvailableQuantity(msi.getSlot("NTMS-DEFAULT-WARE", "012868878271")!),
+      0
+    );
+    assert.equal(
+      msi.getAvailableQuantity(msi.getSlot("NTMS-HAWK-WAREHOU", "012868878271")!),
+      0
+    );
+    assert.equal(
+      msi.getAvailableQuantity(msi.getSlot("NTMS-CANADA-WAREH", "012868878271")!),
+      83
+    );
   });
 
   it("authenticates Admin accounts in constant time, signs HMAC session tokens, and enforces RBAC least-privilege matrix", () => {
@@ -813,7 +805,6 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
 
   it("executes multi-wave partial RMA returns with penny-exact ceiling reconciliation, RESELLABLE vs DAMAGED_QUARANTINE MSI restock, and LIFO compensation", async () => {
     const {
-      sqlEngine,
       inventoryService,
       creditBalances,
       orderStore,
@@ -821,380 +812,364 @@ describe("@super-ecommerce/core — completeCheckoutWorkflow", () => {
       wfStore,
       workflow,
       rmaWorkflow,
-    } = createTestHarness({ useSql: true });
+    } = createTestHarness();
 
-    try {
-      // 1. Complete a 3-unit order of SKU-1 ($10.00 each = $30.00) with $20.00 order voucher -> $10.00 (1000 cents) paid!
-      // Redeeming 300 cents store credit + 700 cents gateway cash = 1000 cents total.
-      const checkoutRes = await workflow.execute(
-        {
-          checkoutId: "chk_rma_1",
-          channelSlug: "us-direct",
-          customerId: "cust-1",
-          stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
-          allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
-          storeCreditToRedeem: 300n,
-          paymentToken: "tok_visa_rma",
-          cart: {
-            currencyCode: "USD",
-            taxMode: "TAX_EXCLUSIVE",
-            shippingBaseAmount: 0n,
-            shippingTaxRateBps: 0,
-            lines: [
-              {
-                lineId: "L-3UNITS",
-                variantId: "SKU-1",
-                quantity: 3,
-                baseUnitPrice: 1000n,
-                taxRateBps: 0,
-              },
-            ],
-            candidateOrderDiscounts: [
-              {
-                discountId: "vouch-20",
-                name: "$20 Off Order",
-                kind: "ORDER_VOUCHER",
-                value: { type: "FIXED", amount: 2000n },
-              },
-            ],
-          },
+    // 1. Complete a 3-unit order of SKU-1 ($10.00 each = $30.00) with $20.00 order voucher -> $10.00 (1000 cents) paid!
+    // Redeeming 300 cents store credit + 700 cents gateway cash = 1000 cents total.
+    const checkoutRes = await workflow.execute(
+      {
+        checkoutId: "chk_rma_1",
+        channelSlug: "us-direct",
+        customerId: "cust-1",
+        stockAvailabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+        allocationStrategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+        storeCreditToRedeem: 300n,
+        paymentToken: "tok_visa_rma",
+        cart: {
+          currencyCode: "USD",
+          taxMode: "TAX_EXCLUSIVE",
+          shippingBaseAmount: 0n,
+          shippingTaxRateBps: 0,
+          lines: [
+            {
+              lineId: "L-3UNITS",
+              variantId: "SKU-1",
+              quantity: 3,
+              baseUnitPrice: 1000n,
+              taxRateBps: 0,
+            },
+          ],
+          candidateOrderDiscounts: [
+            {
+              discountId: "vouch-20",
+              name: "$20 Off Order",
+              kind: "ORDER_VOUCHER",
+              value: { type: "FIXED", amount: 2000n },
+            },
+          ],
         },
-        { idempotencyKey: "idem_chk_rma_1", store: wfStore }
-      );
-      assert.equal(checkoutRes.status, "COMPLETED");
-      const orderId = checkoutRes.output!.orderId;
-      assert.equal(checkoutRes.output!.pricing.totalGrossAmount, 1000n);
-      assert.equal(creditBalances.get("cust-1"), 1700n); // 2000 - 300 = 1700
-      // WH-CENTRAL had 10 onHand (highest stock single hub), allocated 3 -> available = 7
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 3);
+      },
+      { idempotencyKey: "idem_chk_rma_1", store: wfStore }
+    );
+    assert.equal(checkoutRes.status, "COMPLETED");
+    const orderId = checkoutRes.output!.orderId;
+    assert.equal(checkoutRes.output!.pricing.totalGrossAmount, 1000n);
+    assert.equal(creditBalances.get("cust-1"), 1700n); // 2000 - 300 = 1700
+    // WH-CENTRAL had 10 onHand (highest stock single hub), allocated 3 -> available = 7
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 3);
 
-      // 2. Wave 1: Return 1 unit as RESELLABLE -> refunds 334 cents (GatewayCashFirst -> 334 cash)
-      const wave1 = await rmaWorkflow.execute(
-        {
-          rmaId: "rma_wave_1",
-          orderId,
-          linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "RESELLABLE" }],
-        },
-        { idempotencyKey: "idem_rma_wave_1", store: wfStore }
-      );
-      assert.equal(wave1.status, "COMPLETED");
-      assert.equal(wave1.output!.calculation.totalRefundGrossAmount, 334n);
-      assert.equal(wave1.output!.calculation.paymentGatewayRefundAmount, 334n);
-      assert.equal(wave1.output!.calculation.storeCreditRefundAmount, 0n);
-      assert.equal(wave1.output!.orderPaymentStatusAfter, "PARTIALLY_REFUNDED");
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 2);
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityOnHand, 10);
+    // 2. Wave 1: Return 1 unit as RESELLABLE -> refunds 334 cents (GatewayCashFirst -> 334 cash)
+    const wave1 = await rmaWorkflow.execute(
+      {
+        rmaId: "rma_wave_1",
+        orderId,
+        linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "RESELLABLE" }],
+      },
+      { idempotencyKey: "idem_rma_wave_1", store: wfStore }
+    );
+    assert.equal(wave1.status, "COMPLETED");
+    assert.equal(wave1.output!.calculation.totalRefundGrossAmount, 334n);
+    assert.equal(wave1.output!.calculation.paymentGatewayRefundAmount, 334n);
+    assert.equal(wave1.output!.calculation.storeCreditRefundAmount, 0n);
+    assert.equal(wave1.output!.orderPaymentStatusAfter, "PARTIALLY_REFUNDED");
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 2);
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityOnHand, 10);
 
-      // 3. Wave 2: Return 1 unit as DAMAGED_QUARANTINE -> refunds 333 cents (333 cash, leaving 33 cash + 300 store credit)
-      const wave2 = await rmaWorkflow.execute(
-        {
-          rmaId: "rma_wave_2",
-          orderId,
-          linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "DAMAGED_QUARANTINE" }],
-        },
-        { idempotencyKey: "idem_rma_wave_2", store: wfStore }
-      );
-      assert.equal(wave2.status, "COMPLETED");
-      assert.equal(wave2.output!.calculation.totalRefundGrossAmount, 333n);
-      assert.equal(wave2.output!.calculation.paymentGatewayRefundAmount, 333n);
-      assert.equal(wave2.output!.calculation.storeCreditRefundAmount, 0n);
-      // Damaged unit decrements BOTH allocated (2 -> 1) and onHand (10 -> 9)
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 1);
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityOnHand, 9);
+    // 3. Wave 2: Return 1 unit as DAMAGED_QUARANTINE -> refunds 333 cents (333 cash, leaving 33 cash + 300 store credit)
+    const wave2 = await rmaWorkflow.execute(
+      {
+        rmaId: "rma_wave_2",
+        orderId,
+        linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "DAMAGED_QUARANTINE" }],
+      },
+      { idempotencyKey: "idem_rma_wave_2", store: wfStore }
+    );
+    assert.equal(wave2.status, "COMPLETED");
+    assert.equal(wave2.output!.calculation.totalRefundGrossAmount, 333n);
+    assert.equal(wave2.output!.calculation.paymentGatewayRefundAmount, 333n);
+    assert.equal(wave2.output!.calculation.storeCreditRefundAmount, 0n);
+    // Damaged unit decrements BOTH allocated (2 -> 1) and onHand (10 -> 9)
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 1);
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityOnHand, 9);
 
-      // 4. Inject a Commit Fault on Wave 3 attempt -> verifies LIFO rollback of MSI restock, store credit, and gateway refund!
-      const faultAttempt = await rmaWorkflow.execute(
-        {
-          rmaId: "rma_wave_3_fault",
-          orderId,
-          linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "RESELLABLE" }],
-          simulateCommitFault: true,
-        },
-        { idempotencyKey: "idem_rma_wave_3_fault", store: wfStore }
-      );
-      assert.equal(faultAttempt.status, "COMPENSATED");
-      assert.deepEqual(faultAttempt.compensatedSteps, [
-        "refund-payment-gateway",
-        "restore-store-credit",
-        "restock-msi-inventory",
-      ]);
-      // Stock and store credit are unchanged after LIFO rollback!
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 1);
-      assert.equal(creditBalances.get("cust-1"), 1700n);
+    // 4. Inject a Commit Fault on Wave 3 attempt -> verifies LIFO rollback of MSI restock, store credit, and gateway refund!
+    const faultAttempt = await rmaWorkflow.execute(
+      {
+        rmaId: "rma_wave_3_fault",
+        orderId,
+        linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "RESELLABLE" }],
+        simulateCommitFault: true,
+      },
+      { idempotencyKey: "idem_rma_wave_3_fault", store: wfStore }
+    );
+    assert.equal(faultAttempt.status, "COMPENSATED");
+    assert.deepEqual(faultAttempt.compensatedSteps, [
+      "refund-payment-gateway",
+      "restore-store-credit",
+      "restock-msi-inventory",
+    ]);
+    // Stock and store credit are unchanged after LIFO rollback!
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 1);
+    assert.equal(creditBalances.get("cust-1"), 1700n);
 
-      // 5. Healthy Wave 3 (Final unit reconciliation): returns last 1 unit -> 333 cents (33 cash + 300 store credit = 333)
-      const wave3 = await rmaWorkflow.execute(
-        {
-          rmaId: "rma_wave_3_ok",
-          orderId,
-          linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "RESELLABLE" }],
-        },
-        { idempotencyKey: "idem_rma_wave_3_ok", store: wfStore }
-      );
-      assert.equal(wave3.status, "COMPLETED");
-      assert.equal(wave3.output!.calculation.lines[0]!.isFinalUnitReconciliation, true);
-      assert.equal(wave3.output!.calculation.totalRefundGrossAmount, 333n);
-      assert.equal(wave3.output!.calculation.paymentGatewayRefundAmount, 33n);
-      assert.equal(wave3.output!.calculation.storeCreditRefundAmount, 300n);
-      assert.equal(wave3.output!.orderPaymentStatusAfter, "REFUNDED");
+    // 5. Healthy Wave 3 (Final unit reconciliation): returns last 1 unit -> 333 cents (33 cash + 300 store credit = 333)
+    const wave3 = await rmaWorkflow.execute(
+      {
+        rmaId: "rma_wave_3_ok",
+        orderId,
+        linesToReturn: [{ lineId: "L-3UNITS", quantity: 1, condition: "RESELLABLE" }],
+      },
+      { idempotencyKey: "idem_rma_wave_3_ok", store: wfStore }
+    );
+    assert.equal(wave3.status, "COMPLETED");
+    assert.equal(wave3.output!.calculation.lines[0]!.isFinalUnitReconciliation, true);
+    assert.equal(wave3.output!.calculation.totalRefundGrossAmount, 333n);
+    assert.equal(wave3.output!.calculation.paymentGatewayRefundAmount, 33n);
+    assert.equal(wave3.output!.calculation.storeCreditRefundAmount, 300n);
+    assert.equal(wave3.output!.orderPaymentStatusAfter, "REFUNDED");
 
-      // Store credit restored from 1700 -> 2000; allocated stock is now 0; order is REFUNDED
-      assert.equal(creditBalances.get("cust-1"), 2000n);
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 0);
-      assert.equal(orderStore.get(orderId)?.paymentStatus, "REFUNDED");
-      assert.equal(rmaStore.size, 3);
-    } finally {
-      sqlEngine?.close();
-    }
+    // Store credit restored from 1700 -> 2000; allocated stock is now 0; order is REFUNDED
+    assert.equal(creditBalances.get("cust-1"), 2000n);
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 0);
+    assert.equal(orderStore.get(orderId)?.paymentStatus, "REFUNDED");
+    assert.equal(rmaStore.size, 3);
   });
 
   it("orchestrates B2B corporate hierarchy, Net-30 credit pool, 72h MSI reservation hold, supervisor PO approval, and LIFO compensation", async () => {
     const {
-      sqlEngine,
       inventoryService,
       outboxService,
       orderStore,
       wfStore,
-    } = createTestHarness({ useSql: true });
+    } = createTestHarness();
 
-    try {
-      const b2bService = new B2bOrganizationService({
-        inventoryService,
-        outboxService,
-        orderStore,
-        sqlEngine,
-        workflowStateStore: wfStore,
-      });
+    const b2bService = new B2bOrganizationService({
+      inventoryService,
+      outboxService,
+      orderStore,
+      workflowStateStore: wfStore,
+    });
 
-      // 1. Buyer Elena (auto-approve limit $2,500.00 = 250_000c) orders 5 units of SKU-1
-      // Retail $240.00, 5+ tier $210.00 = $1,050.00 (105_000c)
-      // 5% contract discount (-5_250c) -> $997.50 (99_750c), tax-exempt saves $82.29 (8_229c)
-      const autoPo = await b2bService.submitPurchaseOrder({
-        idempotencyKey: "idem_b2b_po_auto_1",
-        input: {
-          poId: "po_auto_1",
-          poNumber: "PO-2026-1001",
-          companyId: "comp-kronos-b2b",
-          costCenterId: "cc-hw-lab",
-          buyerId: "buyer-elena",
-          channelSlug: "us-b2b",
-          cart: {
-            currencyCode: "USD",
-            taxMode: "TAX_EXCLUSIVE",
-            shippingBaseAmount: 0n,
-            shippingTaxRateBps: 825,
-            lines: [
-              {
-                lineId: "L-B2B-1",
-                variantId: "SKU-1",
-                quantity: 5,
-                baseUnitPrice: 24_000n,
-                tierPrices: [
-                  { minQuantity: 5, unitAmount: 21_000n },
-                  { minQuantity: 10, unitAmount: 18_000n },
-                ],
-                taxRateBps: 825,
-              },
-            ],
-          },
+    // 1. Buyer Elena (auto-approve limit $2,500.00 = 250_000c) orders 5 units of SKU-1
+    // Retail $240.00, 5+ tier $210.00 = $1,050.00 (105_000c)
+    // 5% contract discount (-5_250c) -> $997.50 (99_750c), tax-exempt saves $82.29 (8_229c)
+    const autoPo = await b2bService.submitPurchaseOrder({
+      idempotencyKey: "idem_b2b_po_auto_1",
+      input: {
+        poId: "po_auto_1",
+        poNumber: "PO-2026-1001",
+        companyId: "comp-kronos-b2b",
+        costCenterId: "cc-hw-lab",
+        buyerId: "buyer-elena",
+        channelSlug: "us-b2b",
+        cart: {
+          currencyCode: "USD",
+          taxMode: "TAX_EXCLUSIVE",
+          shippingBaseAmount: 0n,
+          shippingTaxRateBps: 825,
+          lines: [
+            {
+              lineId: "L-B2B-1",
+              variantId: "SKU-1",
+              quantity: 5,
+              baseUnitPrice: 24_000n,
+              tierPrices: [
+                { minQuantity: 5, unitAmount: 21_000n },
+                { minQuantity: 10, unitAmount: 18_000n },
+              ],
+              taxRateBps: 825,
+            },
+          ],
         },
-      });
+      },
+    });
 
-      assert.equal(autoPo.po.status, "APPROVED_AUTO");
-      assert.equal(autoPo.po.pricing.totalGrossAmount, 99_750n);
-      assert.equal(autoPo.po.taxExemptSavingsAmount, 8_229n);
-      assert.equal(autoPo.order?.orderId, "ord_po_auto_1");
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 5);
-      assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditUsed, 899_750n); // 800_000 + 99_750
+    assert.equal(autoPo.po.status, "APPROVED_AUTO");
+    assert.equal(autoPo.po.pricing.totalGrossAmount, 99_750n);
+    assert.equal(autoPo.po.taxExemptSavingsAmount, 8_229n);
+    assert.equal(autoPo.order?.orderId, "ord_po_auto_1");
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 5);
+    assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditUsed, 899_750n); // 800_000 + 99_750
 
-      // 2. Buyer Elena orders 10 units of SKU-1 at $180.00 tier = $1,800.00 -> -5% = $1,710.00 (171_000c)
-      // Wait: to exceed her $2,500.00 auto-approve limit, price it at $300.00 tier -> $3,000.00 - 5% = $2,850.00 (285_000c)
-      const pendingPo = await b2bService.submitPurchaseOrder({
-        idempotencyKey: "idem_b2b_po_pend_2",
-        input: {
-          poId: "po_pend_2",
-          poNumber: "PO-2026-1002",
-          companyId: "comp-kronos-b2b",
-          costCenterId: "cc-hw-lab",
-          buyerId: "buyer-elena",
-          channelSlug: "us-b2b",
-          cart: {
-            currencyCode: "USD",
-            taxMode: "TAX_EXCLUSIVE",
-            shippingBaseAmount: 0n,
-            shippingTaxRateBps: 825,
-            lines: [
-              {
-                lineId: "L-B2B-2",
-                variantId: "SKU-1",
-                quantity: 10,
-                baseUnitPrice: 32_000n,
-                tierPrices: [{ minQuantity: 10, unitAmount: 30_000n }],
-                taxRateBps: 825,
-              },
-            ],
-          },
+    // 2. Buyer Elena orders 10 units of SKU-1 at $180.00 tier = $1,800.00 -> -5% = $1,710.00 (171_000c)
+    // Wait: to exceed her $2,500.00 auto-approve limit, price it at $300.00 tier -> $3,000.00 - 5% = $2,850.00 (285_000c)
+    const pendingPo = await b2bService.submitPurchaseOrder({
+      idempotencyKey: "idem_b2b_po_pend_2",
+      input: {
+        poId: "po_pend_2",
+        poNumber: "PO-2026-1002",
+        companyId: "comp-kronos-b2b",
+        costCenterId: "cc-hw-lab",
+        buyerId: "buyer-elena",
+        channelSlug: "us-b2b",
+        cart: {
+          currencyCode: "USD",
+          taxMode: "TAX_EXCLUSIVE",
+          shippingBaseAmount: 0n,
+          shippingTaxRateBps: 825,
+          lines: [
+            {
+              lineId: "L-B2B-2",
+              variantId: "SKU-1",
+              quantity: 10,
+              baseUnitPrice: 32_000n,
+              tierPrices: [{ minQuantity: 10, unitAmount: 30_000n }],
+              taxRateBps: 825,
+            },
+          ],
         },
-      });
+      },
+    });
 
-      assert.equal(pendingPo.po.status, "PENDING_APPROVAL");
-      assert.equal(pendingPo.po.pricing.totalGrossAmount, 285_000n);
-      assert.equal(pendingPo.po.reservationTtlSeconds, 259_200);
-      // 10 units reserved across WH-EAST (5) + WH-CENTRAL (5)
-      assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved, 5);
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved, 5);
-      assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 285_000n);
+    assert.equal(pendingPo.po.status, "PENDING_APPROVAL");
+    assert.equal(pendingPo.po.pricing.totalGrossAmount, 285_000n);
+    assert.equal(pendingPo.po.reservationTtlSeconds, 259_200);
+    // 10 units reserved across WH-EAST (5) + WH-CENTRAL (5)
+    assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved, 5);
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved, 5);
+    assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 285_000n);
 
-      // 3. Supervisor Marcus attempts approval with simulated Step 3 commit fault -> LIFO rollback keeps reservation intact!
-      const faultDecision = await b2bService.decidePendingPurchaseOrder({
-        idempotencyKey: "idem_b2b_approve_fault",
-        poId: "po_pend_2",
-        approverId: "approver-marcus",
-        decision: "APPROVE",
-        simulateCommitFault: true,
-      });
-      assert.equal(faultDecision.workflowStatus, "COMPENSATED");
-      assert.deepEqual(faultDecision.compensatedSteps, [
-        "settle-po-reserved-credit-to-used",
-        "convert-po-reservation-to-allocation",
-      ]);
-      assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved, 5);
-      assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityAllocated, 0);
-      assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 285_000n);
+    // 3. Supervisor Marcus attempts approval with simulated Step 3 commit fault -> LIFO rollback keeps reservation intact!
+    const faultDecision = await b2bService.decidePendingPurchaseOrder({
+      idempotencyKey: "idem_b2b_approve_fault",
+      poId: "po_pend_2",
+      approverId: "approver-marcus",
+      decision: "APPROVE",
+      simulateCommitFault: true,
+    });
+    assert.equal(faultDecision.workflowStatus, "COMPENSATED");
+    assert.deepEqual(faultDecision.compensatedSteps, [
+      "settle-po-reserved-credit-to-used",
+      "convert-po-reservation-to-allocation",
+    ]);
+    assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved, 5);
+    assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityAllocated, 0);
+    assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 285_000n);
 
-      // 4. Supervisor Marcus approves cleanly -> converts MSI reservation to allocation and settles creditReserved -> creditUsed
-      const okDecision = await b2bService.decidePendingPurchaseOrder({
-        idempotencyKey: "idem_b2b_approve_ok",
-        poId: "po_pend_2",
-        approverId: "approver-marcus",
-        decision: "APPROVE",
-      });
-      assert.equal(okDecision.po.status, "APPROVED_BY_SUPERVISOR");
-      assert.equal(okDecision.order?.orderId, "ord_po_pend_2");
-      assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved, 0);
-      assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityAllocated, 5);
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved, 0);
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 10);
-      assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 0n);
-      assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditUsed, 1_184_750n); // 899_750 + 285_000
-    } finally {
-      sqlEngine?.close();
-    }
+    // 4. Supervisor Marcus approves cleanly -> converts MSI reservation to allocation and settles creditReserved -> creditUsed
+    const okDecision = await b2bService.decidePendingPurchaseOrder({
+      idempotencyKey: "idem_b2b_approve_ok",
+      poId: "po_pend_2",
+      approverId: "approver-marcus",
+      decision: "APPROVE",
+    });
+    assert.equal(okDecision.po.status, "APPROVED_BY_SUPERVISOR");
+    assert.equal(okDecision.order?.orderId, "ord_po_pend_2");
+    assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved, 0);
+    assert.equal(inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityAllocated, 5);
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved, 0);
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityAllocated, 10);
+    assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 0n);
+    assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditUsed, 1_184_750n); // 899_750 + 285_000
   });
 
   it("deterministically reaps expired MSI reservations and transitions timed-out PENDING_APPROVAL B2B POs to EXPIRED_TTL", async () => {
     const {
-      sqlEngine,
       inventoryService,
       outboxService,
       orderStore,
       wfStore,
-    } = createTestHarness({ useSql: true });
+    } = createTestHarness();
 
-    try {
-      const b2bService = new B2bOrganizationService({
-        inventoryService,
-        outboxService,
-        orderStore,
-        sqlEngine,
-        workflowStateStore: wfStore,
-      });
-      const reaper = new ReservationTtlReaperService({
-        inventoryService,
-        b2bService,
-        outboxService,
-      });
+    const b2bService = new B2bOrganizationService({
+      inventoryService,
+      outboxService,
+      orderStore,
+      workflowStateStore: wfStore,
+    });
+    const reaper = new ReservationTtlReaperService({
+      inventoryService,
+      b2bService,
+      outboxService,
+    });
 
-      const baseNow = 1_763_300_000_000;
+    const baseNow = 1_763_300_000_000;
 
-      // 1. Seed 1 expired B2B PO hold (4 units @ $750 -> $3,000 - 5% = $2,850 > $2,500 ceiling, TTL=60s created 180s ago)
-      const expiredPoRes = await b2bService.submitPurchaseOrder({
-        idempotencyKey: "idem_ttl_po_1",
-        input: {
-          poId: "po_ttl_exp_1",
-          poNumber: "PO-TTL-1",
-          companyId: "comp-kronos-b2b",
-          costCenterId: "cc-hw-lab",
-          buyerId: "buyer-elena",
-          channelSlug: "us-b2b",
-          ttlSecondsOverride: 60,
-          nowMs: baseNow - 180_000,
-          cart: {
-            currencyCode: "USD",
-            taxMode: "TAX_EXCLUSIVE",
-            shippingBaseAmount: 0n,
-            shippingTaxRateBps: 825,
-            lines: [
-              {
-                lineId: "L-TTL-1",
-                variantId: "SKU-1",
-                quantity: 4,
-                baseUnitPrice: 75_000n,
-                taxRateBps: 825,
-              },
-            ],
-          },
+    // 1. Seed 1 expired B2B PO hold (4 units @ $750 -> $3,000 - 5% = $2,850 > $2,500 ceiling, TTL=60s created 180s ago)
+    const expiredPoRes = await b2bService.submitPurchaseOrder({
+      idempotencyKey: "idem_ttl_po_1",
+      input: {
+        poId: "po_ttl_exp_1",
+        poNumber: "PO-TTL-1",
+        companyId: "comp-kronos-b2b",
+        costCenterId: "cc-hw-lab",
+        buyerId: "buyer-elena",
+        channelSlug: "us-b2b",
+        ttlSecondsOverride: 60,
+        nowMs: baseNow - 180_000,
+        cart: {
+          currencyCode: "USD",
+          taxMode: "TAX_EXCLUSIVE",
+          shippingBaseAmount: 0n,
+          shippingTaxRateBps: 825,
+          lines: [
+            {
+              lineId: "L-TTL-1",
+              variantId: "SKU-1",
+              quantity: 4,
+              baseUnitPrice: 75_000n,
+              taxRateBps: 825,
+            },
+          ],
         },
-      });
-      assert.equal(expiredPoRes.po.status, "PENDING_APPROVAL");
-      assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved, 4);
-      assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 285_000n);
+      },
+    });
+    assert.equal(expiredPoRes.po.status, "PENDING_APPROVAL");
+    assert.equal(inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved, 4);
+    assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 285_000n);
 
-      // 2. Seed 1 expired standalone checkout hold (2 units, TTL=30s created 90s ago)
-      inventoryService.reserveForPurchaseOrder({
-        holderId: "chk_hold_expired",
-        demands: [{ lineId: "L-CHK-1", variantId: "SKU-1", quantity: 2 }],
-        availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
-        strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
-        ttlSeconds: 30,
-        nowMs: baseNow - 90_000,
-      });
+    // 2. Seed 1 expired standalone checkout hold (2 units, TTL=30s created 90s ago)
+    inventoryService.reserveForPurchaseOrder({
+      holderId: "chk_hold_expired",
+      demands: [{ lineId: "L-CHK-1", variantId: "SKU-1", quantity: 2 }],
+      availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+      strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+      ttlSeconds: 30,
+      nowMs: baseNow - 90_000,
+    });
 
-      // 3. Seed 1 active non-expired hold (3 units, TTL=3600s created now) -> MUST NOT be reaped!
-      inventoryService.reserveForPurchaseOrder({
-        holderId: "chk_hold_fresh",
-        demands: [{ lineId: "L-CHK-2", variantId: "SKU-1", quantity: 3 }],
-        availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
-        strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
-        ttlSeconds: 3600,
-        nowMs: baseNow,
-      });
+    // 3. Seed 1 active non-expired hold (3 units, TTL=3600s created now) -> MUST NOT be reaped!
+    inventoryService.reserveForPurchaseOrder({
+      holderId: "chk_hold_fresh",
+      demands: [{ lineId: "L-CHK-2", variantId: "SKU-1", quantity: 3 }],
+      availabilityMode: "DIRECT_CHANNEL_WAREHOUSES",
+      strategy: "MINIMIZE_SPLIT_THEN_HIGH_STOCK",
+      ttlSeconds: 3600,
+      nowMs: baseNow,
+    });
 
-      // Total reserved before reap: 4 + 2 + 3 = 9 units across WH-EAST/WH-CENTRAL
-      const totalReservedBefore =
-        (inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved ?? 0) +
-        (inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved ?? 0);
-      assert.equal(totalReservedBefore, 9);
+    // Total reserved before reap: 4 + 2 + 3 = 9 units across WH-EAST/WH-CENTRAL
+    const totalReservedBefore =
+      (inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved ?? 0) +
+      (inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved ?? 0);
+    assert.equal(totalReservedBefore, 9);
 
-      // 4. Execute Reaper at baseNow -> reaps ONLY the 2 expired holds (6 units), leaving the 3u active hold untouched!
-      const sweep1 = reaper.reapExpired(baseNow);
-      assert.equal(sweep1.stockReap.reapedReservationCount, 2);
-      assert.equal(sweep1.stockReap.totalUnitsReleased, 6);
-      assert.equal(sweep1.expiredPos.length, 1);
-      assert.equal(sweep1.expiredPos[0]?.status, "EXPIRED_TTL");
-      assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 0n);
-      assert.equal(b2bService.getCostCenter("cc-hw-lab")?.monthlyReserved, 0n);
+    // 4. Execute Reaper at baseNow -> reaps ONLY the 2 expired holds (6 units), leaving the 3u active hold untouched!
+    const sweep1 = reaper.reapExpired(baseNow);
+    assert.equal(sweep1.stockReap.reapedReservationCount, 2);
+    assert.equal(sweep1.stockReap.totalUnitsReleased, 6);
+    assert.equal(sweep1.expiredPos.length, 1);
+    assert.equal(sweep1.expiredPos[0]?.status, "EXPIRED_TTL");
+    assert.equal(b2bService.getCompany("comp-kronos-b2b")?.creditReserved, 0n);
+    assert.equal(b2bService.getCostCenter("cc-hw-lab")?.monthlyReserved, 0n);
 
-      const totalReservedAfter =
-        (inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved ?? 0) +
-        (inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved ?? 0);
-      assert.equal(totalReservedAfter, 3);
-      assert.equal(inventoryService.listReservations("ACTIVE").length, 1);
-      assert.equal(inventoryService.listReservations("ACTIVE")[0]?.holderId, "chk_hold_fresh");
-      assert.equal(inventoryService.listReservations("EXPIRED").length, 2);
+    const totalReservedAfter =
+      (inventoryService.getSlot("WH-EAST", "SKU-1")?.quantityReserved ?? 0) +
+      (inventoryService.getSlot("WH-CENTRAL", "SKU-1")?.quantityReserved ?? 0);
+    assert.equal(totalReservedAfter, 3);
+    assert.equal(inventoryService.listReservations("ACTIVE").length, 1);
+    assert.equal(inventoryService.listReservations("ACTIVE")[0]?.holderId, "chk_hold_fresh");
+    assert.equal(inventoryService.listReservations("EXPIRED").length, 2);
 
-      // Outbox recorded both b2b.po.expired_ttl.v1 and inventory.reservation_ttl_reaped.v1
-      const eventTypes = outboxService.listPending().map((e) => e.eventType);
-      assert.equal(eventTypes.includes("b2b.po.expired_ttl.v1"), true);
-      assert.equal(eventTypes.includes("inventory.reservation_ttl_reaped.v1"), true);
+    // Outbox recorded both b2b.po.expired_ttl.v1 and inventory.reservation_ttl_reaped.v1
+    const eventTypes = outboxService.listPending().map((e) => e.eventType);
+    assert.equal(eventTypes.includes("b2b.po.expired_ttl.v1"), true);
+    assert.equal(eventTypes.includes("inventory.reservation_ttl_reaped.v1"), true);
 
-      // 5. Idempotent second reap at same timestamp releases 0 units
-      const sweep2 = reaper.reapExpired(baseNow);
-      assert.equal(sweep2.stockReap.reapedReservationCount, 0);
-      assert.equal(sweep2.stockReap.totalUnitsReleased, 0);
-    } finally {
-      sqlEngine?.close();
-    }
+    // 5. Idempotent second reap at same timestamp releases 0 units
+    const sweep2 = reaper.reapExpired(baseNow);
+    assert.equal(sweep2.stockReap.reapedReservationCount, 0);
+    assert.equal(sweep2.stockReap.totalUnitsReleased, 0);
   });
 });
 

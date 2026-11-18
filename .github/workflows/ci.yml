@@ -75,7 +75,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run full-stack TypeScript test suite (100 tests)
+      - name: Run full-stack TypeScript test suite (zero SQLite)
         run: npm run test:ts
 
       - name: Run kernel benchmark smoke test
@@ -83,3 +83,117 @@ jobs:
 
       - name: Run configurator diff smoke test
         run: npm run configurator diff
+
+  postgres-integration:
+    name: PostgreSQL 17 Live Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: super
+          POSTGRES_PASSWORD: superpassword
+          POSTGRES_DB: super_ecommerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U super -d super_ecommerce"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+
+      - name: Build native N-API cdylib addon
+        run: |
+          cargo build --release --manifest-path crates/kernel-napi/Cargo.toml
+          mkdir -p packages/kernel/native
+          cp target/release/libkernel_napi.so packages/kernel/native/commerce_kernel.node
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run PostgreSQL 17 live integration test suite
+        env:
+          SUPER_PG_USE_WIRE: "1"
+          SUPER_PG_HOST: 127.0.0.1
+          SUPER_PG_PORT: "5432"
+          SUPER_PG_USER: super
+          SUPER_PG_PASSWORD: superpassword
+          SUPER_PG_DB: super_ecommerce
+        run: npm run test:pg-live
+
+  docker:
+    name: Docker Build & PostgreSQL 17 Container Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build production Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: super-ecommerce:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test container against postgres:17-alpine
+        run: |
+          docker network create ci-net
+          docker run -d --name ci-pg17 --network ci-net \
+            -e POSTGRES_USER=super \
+            -e POSTGRES_PASSWORD=superpassword \
+            -e POSTGRES_DB=super_ecommerce \
+            postgres:17-alpine
+          for i in $(seq 1 20); do
+            if docker exec ci-pg17 pg_isready -U super -d super_ecommerce >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker run -d --name ci-app --network ci-net -p 4100:4100 \
+            -e SUPER_PG_USE_WIRE=1 \
+            -e SUPER_PG_HOST=ci-pg17 \
+            -e SUPER_PG_PORT=5432 \
+            -e SUPER_PG_USER=super \
+            -e SUPER_PG_PASSWORD=superpassword \
+            -e SUPER_PG_DB=super_ecommerce \
+            super-ecommerce:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4100/healthz >/tmp/healthz.json 2>/dev/null; then
+              cat /tmp/healthz.json
+              grep -q '"database":"postgres"' /tmp/healthz.json
+              grep -q '"pgVersion":"17\.' /tmp/healthz.json
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ci-app || true
+          exit 1
+
+      - name: Clean up smoke test containers
+        if: always()
+        run: |
+          docker rm -f ci-app ci-pg17 2>/dev/null || true
+          docker network rm ci-net 2>/dev/null || true
