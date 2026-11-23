@@ -215,6 +215,24 @@ export interface McpToolDescriptorDto {
   readonly description: string;
 }
 
+export interface McpDiagnosticInvocationLogDto {
+  readonly invocationId: string;
+  readonly toolName: string;
+  readonly persona: string;
+  readonly latencyUs: number;
+  readonly status: "SUCCESS" | "VALIDATION_BLOCKED";
+  readonly headlineFinding: string;
+  readonly structuredDetails: readonly {
+    readonly key: string;
+    readonly stepOrTarget: string;
+    readonly pass1OrInput: string;
+    readonly pass2OrRule: string;
+    readonly finalOutcome: string;
+    readonly severity: "OK" | "WARN" | "INFO";
+  }[];
+  readonly executedAtIso: string;
+}
+
 export function createAdminRpcClient(options?: {
   readonly baseUrl?: string;
   readonly fetchImpl?: FetchLike;
@@ -360,6 +378,8 @@ export function createAdminRpcClient(options?: {
         });
         return (await res.json()) as Record<string, unknown>;
       },
+      listLogs: (limit = 25) =>
+        callRpc<readonly McpDiagnosticInvocationLogDto[]>("mcp.listLogs", { limit }),
     },
   };
 }

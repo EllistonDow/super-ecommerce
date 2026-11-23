@@ -608,6 +608,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
       listTools: async () => mcpServer.listTools(),
       diagnoseWaterfall: async (input: CartCalculationInput) =>
         mcpServer.diagnosePriceWaterfall(input),
+      listLogs: async (limit = 25) => mcpServer.listInvocationLogs(limit),
     },
   };
 
@@ -863,6 +864,11 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         case "mcp.listTools": {
           const tools = await rpcClient.mcp.listTools();
           return jsonResponse({ ok: true, data: tools });
+        }
+        case "mcp.listLogs": {
+          const limit = typeof body["limit"] === "number" ? body["limit"] : 25;
+          const logs = await rpcClient.mcp.listLogs(limit);
+          return jsonResponse({ ok: true, data: logs });
         }
         case "mcp.diagnoseWaterfall": {
           const diag = await rpcClient.mcp.diagnoseWaterfall(

@@ -635,7 +635,11 @@ export class SuperCommerceMcpServer {
               output = this.searchCatalogHybridDetailed({
                 channelSlug: String(rawArgs["channelSlug"] ?? "us-retail"),
                 queryText:
-                  typeof rawArgs["queryText"] === "string" ? rawArgs["queryText"] : undefined,
+                  typeof rawArgs["queryText"] === "string"
+                    ? rawArgs["queryText"]
+                    : typeof rawArgs["query"] === "string"
+                    ? rawArgs["query"]
+                    : undefined,
                 inStockOnly:
                   typeof rawArgs["inStockOnly"] === "boolean"
                     ? rawArgs["inStockOnly"]

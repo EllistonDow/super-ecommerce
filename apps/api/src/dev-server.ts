@@ -730,6 +730,10 @@ function buildDemoCartInput(
           const listing = variant ? LISTINGS_BY_KEY.get(`${channel.id}:${variant.id}`) : undefined;
           const projection = combinedProjectionsForChannel(channel).flatMap((p) => p.variantsSnapshot).find((v) => v.sku === line.variantId);
           if (!projection || (variant && !listing?.isPublished)) {
+            const hasMsiStock = inventoryService.listAllSlots().some((s) => s.variantId === line.variantId);
+            if (hasMsiStock) {
+              return { lineId: `L-${idx + 1}`, variantId: line.variantId, quantity, baseUnitPrice: BigInt(line.baseUnitPrice), tierPrices: [], taxRateBps: taxBps, isGift: false };
+            }
             throw new RequestInputError(`SKU '${line.variantId}' is not published in ${channel.slug}`);
           }
           return { lineId: `L-${idx + 1}`, variantId: line.variantId, quantity, baseUnitPrice: projection.effectivePrice, tierPrices: listing?.tierPrices ?? [], taxRateBps: taxBps, isGift: false };
@@ -1452,6 +1456,7 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
   const gateway = createSuperCommerceGateway({
     projections: CHANNELS.flatMap(combinedProjectionsForChannel),
     inventoryService,
+    pgPool,
   });
 
   function refreshCatalogReaders() {
@@ -3338,6 +3343,7 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
       const report = await syncAndBenchmarkSaleorLiveCatalog({
         forceRefresh: action === "sync_saleor_stock",
       });
+      cacheSaleorCatalog(report);
       const syncedCount = inventoryService.upsertExternalSlots(
         report.syncedMsiSlots,
         { preserveAllocated: action !== "sync_saleor_stock" }

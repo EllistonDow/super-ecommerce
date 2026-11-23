@@ -71,8 +71,10 @@ export interface LedgerJournalRecord {
 export interface AccountTrialBalanceRow {
   readonly currencyCode: string;
   readonly accountCode: LedgerAccountCode;
+  readonly normalBalance?: "DEBIT" | "CREDIT";
   readonly debitTotal: MinorUnits;
   readonly creditTotal: MinorUnits;
+  readonly netBalance?: MinorUnits;
   readonly netDebitMinusCredit: MinorUnits;
 }
 
@@ -468,13 +470,23 @@ export class PgDoubleEntryLedgerService {
 
     const accounts: AccountTrialBalanceRow[] = [...map.entries()]
       .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([accountCode, totals]) => ({
-        currencyCode: currencyCode.toUpperCase().trim(),
-        accountCode,
-        debitTotal: totals.debit,
-        creditTotal: totals.credit,
-        netDebitMinusCredit: totals.debit - totals.credit,
-      }));
+      .map(([accountCode, totals]) => {
+        const normalBalance: "DEBIT" | "CREDIT" =
+          accountCode === "CASH_GATEWAY_CLEARING" ? "DEBIT" : "CREDIT";
+        const netBalance =
+          normalBalance === "DEBIT"
+            ? totals.debit - totals.credit
+            : totals.credit - totals.debit;
+        return {
+          currencyCode: currencyCode.toUpperCase().trim(),
+          accountCode,
+          normalBalance,
+          debitTotal: totals.debit,
+          creditTotal: totals.credit,
+          netBalance,
+          netDebitMinusCredit: totals.debit - totals.credit,
+        };
+      });
 
     return {
       currencyCode: currencyCode.toUpperCase().trim(),
