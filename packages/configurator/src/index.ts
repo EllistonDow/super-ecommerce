@@ -1340,3 +1340,6 @@ export class PgStoreConfigurator {
     }
   }
 }
+
+export * from "./pim-adapter.ts";
+export * from "./pim-postgres.ts";

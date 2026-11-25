@@ -37,6 +37,7 @@ import {
   syncOutboxEventsToPostgres,
   syncStoreConfigToPostgres,
   syncWorkflowRunsToPostgres,
+  type CatalogChannelProjectionRecord,
   type CatalogFacetSortOrder,
   type ChannelRecord,
   type HybridSearchReport,
@@ -680,6 +681,7 @@ function buildDemoCartInput(
     includeManual: boolean;
     voucherCode?: string;
     customLines?: readonly CustomCartLinePayload[];
+    catalogProjections?: readonly CatalogChannelProjectionRecord[];
   }
 ): CartCalculationInput {
   const candidateOrderDiscounts: CandidateOrderDiscount[] = [];
@@ -718,6 +720,10 @@ function buildDemoCartInput(
   if (flags.customLines !== undefined && (!Array.isArray(flags.customLines) || flags.customLines.length === 0 || flags.customLines.length > 100)) {
     throw new RequestInputError("Cart must contain between 1 and 100 lines");
   }
+  const publishedVariants = flags.customLines && new Map(
+    (flags.catalogProjections ?? combinedProjectionsForChannel(channel))
+      .flatMap((product) => product.variantsSnapshot.map((variant) => [variant.sku, variant] as const)),
+  );
   const resolvedLines =
     flags.customLines
       ? flags.customLines.map((line, idx) => {
@@ -728,9 +734,9 @@ function buildDemoCartInput(
           }
           const variant = VARIANTS.find((v) => v.sku === line.variantId);
           const listing = variant ? LISTINGS_BY_KEY.get(`${channel.id}:${variant.id}`) : undefined;
-          const projection = combinedProjectionsForChannel(channel).flatMap((p) => p.variantsSnapshot).find((v) => v.sku === line.variantId);
-          if (!projection || (variant && !listing?.isPublished)) {
-            const hasMsiStock = inventoryService.listAllSlots().some((s) => s.variantId === line.variantId);
+          const projection = publishedVariants?.get(line.variantId);
+          if (!projection) {
+            const hasMsiStock = !variant && inventoryService.listAllSlots().some((s) => s.variantId === line.variantId);
             if (hasMsiStock) {
               return { lineId: `L-${idx + 1}`, variantId: line.variantId, quantity, baseUnitPrice: BigInt(line.baseUnitPrice), tierPrices: [], taxRateBps: taxBps, isGift: false };
             }
@@ -1459,6 +1465,33 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
     pgPool,
   });
 
+  async function refreshStorefrontSaleorCatalog() {
+    if (process.env["SUPER_STOREFRONT_SALEOR_SYNC"] !== "0") {
+      cacheSaleorCatalog(await syncAndBenchmarkSaleorLiveCatalog());
+    }
+  }
+
+  function readStorefrontCatalog(channel: ChannelRecord) {
+    return gateway.mcpServer.listChannelProjections(channel.slug, combinedProjectionsForChannel(channel));
+  }
+
+  async function readCartCatalog(channel: ChannelRecord, lines?: readonly CustomCartLinePayload[]) {
+    if (!Array.isArray(lines) || pgPool instanceof OfflinePgPool) return undefined;
+    const projections = await readStorefrontCatalog(channel);
+    const published = new Set(projections.flatMap((product) => product.variantsSnapshot.map((variant) => variant.sku)));
+    const missingSkus = lines.filter((line) => !line.isGift && !published.has(line.variantId)).map((line) => line.variantId);
+    if (missingSkus.length > 0) {
+      const { rows: [hidden] } = await pgPool.query<{ sku: string }>(
+        `SELECT v.sku FROM product_variants v JOIN products p ON p.id = v.product_id
+         WHERE p.pim_source IS NOT NULL AND v.sku IN (SELECT jsonb_array_elements_text($1::jsonb))
+         LIMIT 1`,
+        [JSON.stringify(missingSkus)],
+      );
+      if (hidden) throw new RequestInputError(`SKU '${hidden.sku}' is not published in ${channel.slug}`);
+    }
+    return projections;
+  }
+
   function refreshCatalogReaders() {
     const projections = CHANNELS.flatMap(combinedProjectionsForChannel);
     phase7SearchEngine.reindex(projections);
@@ -1630,11 +1663,11 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
       const requestedSlug = url.searchParams.get("channel") ?? "us-retail";
       const activeChannel =
         CHANNELS.find((c) => c.slug === requestedSlug) ?? CHANNELS[0]!;
-      const saleorReport = await syncAndBenchmarkSaleorLiveCatalog();
-      cacheSaleorCatalog(saleorReport);
-      const baseProjections = combinedProjectionsForChannel(activeChannel);
+      await refreshStorefrontSaleorCatalog();
+      const baseProjections = await readStorefrontCatalog(activeChannel);
       const facetQueryResult = await queryCatalogProjectionsWithJsonbFacets({
         channelSlug: activeChannel.slug,
+        includeOutOfStock: !(pgPool instanceof OfflinePgPool),
         seedProjections: baseProjections,
         deleteProductIds: PRODUCTS.filter((p) => !baseProjections.some((projection) => projection.productId === p.id)).map((p) => p.id),
         pool: pgPool,
@@ -1669,10 +1702,8 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
       const activeChannel =
         CHANNELS.find((c) => c.slug === requestedSlug) ?? CHANNELS[0]!;
       const selectedVariantSku = url.searchParams.get("variant") ?? undefined;
-      const saleorReport = await syncAndBenchmarkSaleorLiveCatalog();
-      cacheSaleorCatalog(saleorReport);
-      const baseProjections = combinedProjectionsForChannel(activeChannel);
-      const combined = baseProjections;
+      await refreshStorefrontSaleorCatalog();
+      const combined = await readStorefrontCatalog(activeChannel);
       const projection = combined.find((p) => p.productSlug === slug);
       if (!projection) {
         return new Response(
@@ -1716,8 +1747,8 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
       const requestedSlug = url.searchParams.get("channel") ?? "us-retail";
       const activeChannel =
         CHANNELS.find((c) => c.slug === requestedSlug) ?? CHANNELS[0]!;
-      cacheSaleorCatalog(await syncAndBenchmarkSaleorLiveCatalog());
-      const catalogItems = combinedProjectionsForChannel(activeChannel)
+      await refreshStorefrontSaleorCatalog();
+      const catalogItems = (await readStorefrontCatalog(activeChannel))
         .flatMap((p) =>
           p.variantsSnapshot.map((v) => ({
             sku: v.sku,
@@ -1863,10 +1894,11 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
       };
       const activeChannel =
         CHANNELS.find((c) => c.slug === body.channelSlug) ?? CHANNELS[0]!;
-      cacheSaleorCatalog(await syncAndBenchmarkSaleorLiveCatalog());
-      const baseProjections = combinedProjectionsForChannel(activeChannel);
+      await refreshStorefrontSaleorCatalog();
+      const baseProjections = await readStorefrontCatalog(activeChannel);
       const result = await queryCatalogProjectionsWithJsonbFacets({
         channelSlug: activeChannel.slug,
+        includeOutOfStock: !(pgPool instanceof OfflinePgPool),
         selectedFacets: body.selectedFacets,
         maxPriceCents: body.maxPriceCents,
         minAvailableQty: body.minAvailableQty,
@@ -3878,6 +3910,7 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
           includeManual: Boolean(body.includeManual),
           voucherCode: body.voucherCode,
           customLines: body.customLines,
+        catalogProjections: await readCartCatalog(channel, body.customLines),
         })
       );
       const sym = pricing.currencyCode === "EUR" ? "€" : "$";
@@ -3953,6 +3986,7 @@ export function createAppRequestHandler(options: { pgPool?: PgPoolLike } = {}) {
         includeManual: body.includeManual ?? false,
         voucherCode: body.voucherCode,
         customLines: body.customLines,
+        catalogProjections: await readCartCatalog(channel, body.customLines),
       });
 
       const failPayment =

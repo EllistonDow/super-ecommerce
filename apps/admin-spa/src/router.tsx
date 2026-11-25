@@ -16,6 +16,7 @@ import { OrdersOmsPage } from "./routes/OrdersOmsPage.tsx";
 import { CartsPaymentsPage } from "./routes/CartsPaymentsPage.tsx";
 import { InventoryOutboxPage } from "./routes/InventoryOutboxPage.tsx";
 import { McpCopilotPage } from "./routes/McpCopilotPage.tsx";
+import { PimIntegrationPage } from "./routes/PimIntegrationPage.tsx";
 
 export interface AdminRouterContext {
   readonly rpc: AdminRpcClient;
@@ -80,6 +81,15 @@ const rootRoute = createRootRouteWithContext<AdminRouterContext>()({
                   <span>MCP Copilot</span>
                 </Link>
               </li>
+              <li>
+                <Link
+                  to="/pim"
+                  className="nav-link"
+                  activeProps={{ "aria-current": "page" }}
+                >
+                  <span>PIM Integration</span>
+                </Link>
+              </li>
             </ul>
           </nav>
         </aside>
@@ -136,12 +146,22 @@ const mcpRoute = createRoute({
   },
 });
 
+const pimRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/pim",
+  component: function PimRouteComponent() {
+    const { rpc } = pimRoute.useRouteContext();
+    return <PimIntegrationPage rpc={rpc} />;
+  },
+});
+
 const routeTree = rootRoute.addChildren([
   overviewRoute,
   ordersRoute,
   cartsPaymentsRoute,
   inventoryRoute,
   mcpRoute,
+  pimRoute,
 ]);
 
 export function buildAdminRouter(options: {

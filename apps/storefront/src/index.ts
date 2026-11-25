@@ -16,6 +16,7 @@ import type {
   FacetDimensionGroup,
 } from "@super-ecommerce/db";
 import type { CartCalculationResult } from "@super-ecommerce/kernel";
+import { escapeHtml, STOREFRONT_ESCAPE_HTML_SCRIPT } from "./pdp-checkout-rma.ts";
 
 export {
   renderProductDetailHtml,
@@ -97,8 +98,8 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
             <button type="button"
                     class="facet-pill btn-press mono-meta ${b.selected ? "active" : ""}"
                     data-facet-dim="${grp.key}"
-                    data-facet-val="${b.value}">
-              <span>${b.value}</span>
+                    data-facet-val="${escapeHtml(b.value)}">
+              <span>${escapeHtml(b.value)}</span>
               <span class="facet-count">(${b.count})</span>
             </button>`
             )
@@ -125,7 +126,7 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
       const attrBadges = Object.entries(p.mergedAttributes)
         .map(([k, vals]) => {
           const firstVal = String(vals[0] ?? "");
-          return `<button type="button" class="spec-chip btn-press" data-facet-dim="${k}" data-facet-val="${firstVal}">${k}: ${vals.join(", ")}</button>`;
+          return `<button type="button" class="spec-chip btn-press" data-facet-dim="${escapeHtml(k)}" data-facet-val="${escapeHtml(firstVal)}">${escapeHtml(k)}: ${escapeHtml(vals.join(", "))}</button>`;
         })
         .join("");
 
@@ -137,13 +138,15 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
           ? `<span class="price-compare">${formatMoney(firstVariant.compareAtAmount, p.currencyCode)}</span>`
           : "";
 
-      const imageSeed = `kronos-hw-${p.productSlug}`;
+      const imageSeed = `kronos-hw-${encodeURIComponent(p.productSlug)}`;
       const pdpHref = `/products/${encodeURIComponent(p.productSlug)}?channel=${encodeURIComponent(activeChannel.slug)}`;
+      const productName = escapeHtml(p.productName);
+      const sku = escapeHtml(variantSku);
       return `
-      <article class="product-tile stagger-item" style="animation-delay: ${idx * 55}ms" data-product-slug="${p.productSlug}">
+      <article class="product-tile stagger-item" style="animation-delay: ${idx * 55}ms" data-product-slug="${escapeHtml(p.productSlug)}">
         <a href="${pdpHref}" class="product-media" style="display: block;">
           <img src="https://picsum.photos/seed/${imageSeed}/720/540"
-               alt="${p.productName}"
+               alt="${productName}"
                width="720"
                height="540"
                loading="${idx < 2 ? "eager" : "lazy"}" />
@@ -151,8 +154,8 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
         <div class="product-body">
           <div class="product-header">
             <div>
-              <h3 class="product-title"><a href="${pdpHref}" style="color: inherit; text-decoration: none;">${p.productName}</a></h3>
-              <p class="product-sku">SKU: ${variantSku} / Avail: ${p.totalAvailableQty} units</p>
+              <h3 class="product-title"><a href="${pdpHref}" style="color: inherit; text-decoration: none;">${productName}</a></h3>
+              <p class="product-sku">SKU: ${sku} / ${p.isInStock ? `Avail: ${p.totalAvailableQty} units` : "Out of Stock"}</p>
             </div>
             <div class="product-price-block">
               ${compareAt}
@@ -166,10 +169,10 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
             </a>
             <button type="button"
                     class="btn-primary btn-press"
-                    data-add-variant="${variantId}"
-                    data-add-sku="${variantSku}"
-                    data-variant-name="${p.productName}"
-                    data-base-price="${p.minEffectivePrice.toString()}">
+                    data-add-variant="${escapeHtml(variantId)}"
+                    data-add-sku="${sku}"
+                    data-variant-name="${productName}"
+                    data-base-price="${p.minEffectivePrice.toString()}"${p.isInStock ? "" : " disabled"}>
               Add to Cart
             </button>
           </div>
@@ -1149,6 +1152,8 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
       if (e.target === slideoverBackdrop) toggleDrawer(false);
     });
 
+    ${STOREFRONT_ESCAPE_HTML_SCRIPT}
+
     function renderLinesHtml(lines) {
       return lines
         .map(
@@ -1156,7 +1161,7 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
             '<div class="cart-line-row">' +
             '<div>' +
             '<div class="cart-line-title">' +
-            line.variantId +
+            escapeHtml(line.variantId) +
             (line.isGift ? ' <span class="gift-tag">FREE GIFT</span>' : "") +
             "</div>" +
             '<div class="cart-line-sub">' +
@@ -1173,13 +1178,13 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
               ? ""
               : '<div class="qty-controls">' +
                 '<button type="button" class="qty-btn" data-qty-sku="' +
-                line.variantId +
+                escapeHtml(line.variantId) +
                 '" data-qty-delta="-1">-1</button>' +
                 '<button type="button" class="qty-btn" data-qty-sku="' +
-                line.variantId +
+                escapeHtml(line.variantId) +
                 '" data-qty-delta="1">+1</button>' +
                 '<button type="button" class="qty-btn" data-remove-sku="' +
-                line.variantId +
+                escapeHtml(line.variantId) +
                 '">Remove</button>' +
                 "</div>") +
             "</div>" +
@@ -1254,10 +1259,10 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
                   '" data-facet-dim="' +
                   grp.key +
                   '" data-facet-val="' +
-                  b.value +
+                  escapeHtml(b.value) +
                   '">' +
                   "<span>" +
-                  b.value +
+                  escapeHtml(b.value) +
                   "</span>" +
                   '<span class="facet-count">(' +
                   b.count +
@@ -1283,13 +1288,13 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
               const firstVal = String(arr[0] ?? "");
               return (
                 '<button type="button" class="spec-chip btn-press" data-facet-dim="' +
-                k +
+                escapeHtml(k) +
                 '" data-facet-val="' +
-                firstVal +
+                escapeHtml(firstVal) +
                 '">' +
-                k +
+                escapeHtml(k) +
                 ": " +
-                arr.join(", ") +
+                escapeHtml(arr.join(", ")) +
                 "</button>"
               );
             })
@@ -1297,13 +1302,13 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
           const compareHtml = p.compareAtFormatted
             ? '<span class="price-compare">' + p.compareAtFormatted + "</span>"
             : "";
-          const seed = "kronos-hw-" + p.productSlug;
+          const seed = "kronos-hw-" + encodeURIComponent(p.productSlug);
           const pdpHref = "/products/" + encodeURIComponent(p.productSlug) + "?channel=${activeChannel.slug}";
           return (
             '<article class="product-tile stagger-item" style="animation-delay: ' +
             idx * 35 +
             'ms" data-product-slug="' +
-            p.productSlug +
+            escapeHtml(p.productSlug) +
             '">' +
             '<a href="' +
             pdpHref +
@@ -1311,7 +1316,7 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
             '<img src="https://picsum.photos/seed/' +
             seed +
             '/720/540" alt="' +
-            p.productName +
+            escapeHtml(p.productName) +
             '" width="720" height="540" loading="lazy" />' +
             "</a>" +
             '<div class="product-body">' +
@@ -1320,13 +1325,12 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
             '<h3 class="product-title"><a href="' +
             pdpHref +
             '" style="color: inherit; text-decoration: none;">' +
-            p.productName +
+            escapeHtml(p.productName) +
             "</a></h3>" +
             '<p class="product-sku">SKU: ' +
-            p.variantSku +
-            " / Avail: " +
-            p.totalAvailableQty +
-            " units</p>" +
+            escapeHtml(p.variantSku) +
+            (p.totalAvailableQty > 0 ? " / Avail: " + p.totalAvailableQty + " units" : " / Out of Stock") +
+            "</p>" +
             "</div>" +
             '<div class="product-price-block">' +
             compareHtml +
@@ -1343,14 +1347,14 @@ export function renderStorefrontHtml(input: StorefrontRenderInput): string {
             pdpHref +
             '" class="btn-secondary btn-press" style="padding: 9px 12px; font-size: 0.8rem;">Variants &amp; Stock</a>' +
             '<button type="button" class="btn-primary btn-press" data-add-variant="' +
-            p.variantId +
+            escapeHtml(p.variantId) +
             '" data-add-sku="' +
-            p.variantSku +
+            escapeHtml(p.variantSku) +
             '" data-variant-name="' +
-            p.productName +
+            escapeHtml(p.productName) +
             '" data-base-price="' +
             p.minEffectivePriceCents +
-            '">Add to Cart</button>' +
+            '"' + (p.totalAvailableQty > 0 ? "" : " disabled") + '>Add to Cart</button>' +
             "</div>" +
             "</div>" +
             "</article>"

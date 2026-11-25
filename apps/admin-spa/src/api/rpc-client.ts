@@ -233,6 +233,49 @@ export interface McpDiagnosticInvocationLogDto {
   readonly executedAtIso: string;
 }
 
+export interface PimMaterializedCatalogProjectionDto {
+  readonly productSlug: string;
+  readonly productName: string;
+  readonly channelSlug: string;
+  readonly sku: string;
+  readonly minEffectivePrice: string;
+  readonly isInStock: boolean;
+  readonly totalAvailableQty: number;
+  readonly mediaUrl: string;
+  readonly mergedAttributes: Record<string, unknown>;
+}
+
+export interface PimIngestionAuditEntryDto {
+  readonly syncId: string;
+  readonly systemSource: string;
+  readonly exportId: string;
+  readonly status: "APPLIED" | "PREFLIGHT_BLOCKED" | "ZERO_DIFF_NOOP";
+  readonly durationUs: number;
+  readonly familiesCount: number;
+  readonly productsCount: number;
+  readonly diffPlan?: {
+    readonly totalChanges: number;
+    readonly entries: readonly {
+      readonly stage: string;
+      readonly operation: string;
+      readonly slug: string;
+      readonly summary: string;
+    }[];
+  };
+  readonly issues: readonly string[];
+  readonly summary: string;
+  readonly materializedProjectionsCount: number;
+  readonly executedAtIso: string;
+}
+
+export interface PimSyncStatusDto {
+  readonly systemSource: string;
+  readonly lastSyncIso: string | null;
+  readonly materializedProjectionsCount: number;
+  readonly auditHistory: readonly PimIngestionAuditEntryDto[];
+  readonly materializedProjections: readonly PimMaterializedCatalogProjectionDto[];
+}
+
 export function createAdminRpcClient(options?: {
   readonly baseUrl?: string;
   readonly fetchImpl?: FetchLike;
@@ -380,6 +423,26 @@ export function createAdminRpcClient(options?: {
       },
       listLogs: (limit = 25) =>
         callRpc<readonly McpDiagnosticInvocationLogDto[]>("mcp.listLogs", { limit }),
+    },
+    pim: {
+      getSyncStatus: () => callRpc<PimSyncStatusDto>("pim.getSyncStatus"),
+      syncSample: (simulateFault = false) =>
+        callRpc<{
+          ok: boolean;
+          audit: PimIngestionAuditEntryDto;
+          materializedProjections: readonly PimMaterializedCatalogProjectionDto[];
+        }>("pim.sync", { simulateFault }),
+      preview: () =>
+        callRpc<{
+          ok: boolean;
+          issues: readonly string[];
+          plan?: { totalChanges: number };
+          durationUs: number;
+        }>("pim.preview"),
+      listLogs: (limit = 10) =>
+        callRpc<readonly PimIngestionAuditEntryDto[]>("pim.listLogs", { limit }),
+      listProjections: () =>
+        callRpc<readonly PimMaterializedCatalogProjectionDto[]>("pim.listProjections"),
     },
   };
 }

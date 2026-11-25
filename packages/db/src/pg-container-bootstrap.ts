@@ -944,6 +944,7 @@ options?: { pool?: PgPoolLike }
          ON CONFLICT (slug) DO UPDATE SET
            name = EXCLUDED.name,
            attributes = EXCLUDED.attributes
+         WHERE to_jsonb(products)->>'pim_source' IS NULL
          RETURNING id`,
         [
           prod.slug,

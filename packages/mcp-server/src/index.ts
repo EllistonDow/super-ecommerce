@@ -126,12 +126,32 @@ export interface McpDiagnosticInvocationLog {
 export class SuperCommerceMcpServer {
   private readonly projections: CatalogChannelProjectionRecord[];
   private readonly hybridSearchEngine: HybridCatalogSearchEngine;
+  private readonly loadChannelProjections?: (
+    channelSlug: string,
+    seeds: readonly CatalogChannelProjectionRecord[],
+  ) => Promise<readonly CatalogChannelProjectionRecord[]>;
   private readonly invocationLogs: McpDiagnosticInvocationLog[] = [];
   private invocationSeq = 0;
 
-  constructor(initialProjections: readonly CatalogChannelProjectionRecord[] = []) {
+  constructor(
+    initialProjections: readonly CatalogChannelProjectionRecord[] = [],
+    loadChannelProjections?: SuperCommerceMcpServer["loadChannelProjections"],
+  ) {
     this.projections = [...initialProjections];
     this.hybridSearchEngine = new HybridCatalogSearchEngine(this.projections);
+    this.loadChannelProjections = loadChannelProjections;
+  }
+
+  async listChannelProjections(
+    channelSlug: string,
+    seeds = this.projections.filter((projection) => projection.channelSlug === channelSlug),
+  ): Promise<readonly CatalogChannelProjectionRecord[]> {
+    return this.loadChannelProjections ? this.loadChannelProjections(channelSlug, seeds) : seeds;
+  }
+
+  async searchPublishedCatalog(query: CatalogHybridSearchQuery): Promise<HybridSearchReport> {
+    const projections = this.loadChannelProjections ? await this.listChannelProjections(query.channelSlug) : undefined;
+    return this.searchCatalogHybridDetailed(query, projections);
   }
 
   setProjections(nextProjections: readonly CatalogChannelProjectionRecord[]): void {
@@ -419,8 +439,12 @@ export class SuperCommerceMcpServer {
   /**
    * Tool 3: `search_catalog_hybrid` (Detailed RRF Report: Okapi BM25 + 64D Vector Cosine)
    */
-  searchCatalogHybridDetailed(query: CatalogHybridSearchQuery): HybridSearchReport {
-    const report = this.hybridSearchEngine.search(query);
+  searchCatalogHybridDetailed(
+    query: CatalogHybridSearchQuery,
+    channelProjections?: readonly CatalogChannelProjectionRecord[],
+  ): HybridSearchReport {
+    const engine = channelProjections ? new HybridCatalogSearchEngine(channelProjections) : this.hybridSearchEngine;
+    const report = engine.search(query);
     const filterDesc = query.attributeFilters
       ? JSON.stringify(query.attributeFilters)
       : "{}";
@@ -632,7 +656,7 @@ export class SuperCommerceMcpServer {
               );
               break;
             case "search_catalog_hybrid":
-              output = this.searchCatalogHybridDetailed({
+              output = await this.searchPublishedCatalog({
                 channelSlug: String(rawArgs["channelSlug"] ?? "us-retail"),
                 queryText:
                   typeof rawArgs["queryText"] === "string"

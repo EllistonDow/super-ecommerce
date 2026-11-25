@@ -65,6 +65,15 @@ import {
   type CatalogHybridSearchQuery,
   type McpJsonRpcRequest,
 } from "@super-ecommerce/mcp-server";
+import {
+  InvalidPimPayloadError,
+  PgPimAdapter,
+  PimCatalogConflictError,
+  StatefulPimAdapter,
+  SAMPLE_AKENEO_PIM_EXPORT,
+  INVALID_PIM_EXPORT_FAULT_DEMO,
+  type PimIngestionPayload,
+} from "@super-ecommerce/configurator";
 
 export interface SuperCommerceGatewayOptions {
   readonly pgPool?: PgPoolLike;
@@ -301,7 +310,12 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
   const customersService = new PgCustomersService(pgPool);
   const customerCartService = new PgCustomerAuthAndCartService(pgPool);
   const paymentIntentService = new PgStripePaymentIntentService({ pool: pgPool });
-  const mcpServer = new SuperCommerceMcpServer(projections);
+  const pgPim = pgPool instanceof OfflinePgPool ? undefined : new PgPimAdapter(pgPool);
+  const pimAdapter = pgPim ?? new StatefulPimAdapter();
+  const mcpServer = new SuperCommerceMcpServer(
+    projections,
+    pgPim?.listChannelProjections.bind(pgPim),
+  );
   const maxGraphQlDepth = options.maxGraphQlDepth ?? 8;
   const maxGraphQlAliases = options.maxGraphQlAliases ?? 8;
 
@@ -393,10 +407,16 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
    */
   const rpcClient = {
     catalog: {
-      search: async (query: CatalogHybridSearchQuery) =>
-        mcpServer.searchCatalogHybrid(query),
-      hybridSearch: async (query: CatalogHybridSearchQuery) =>
-        mcpServer.searchCatalogHybridDetailed(query),
+      search: async (query: CatalogHybridSearchQuery) => {
+        if (!pgPim) return mcpServer.searchCatalogHybrid(query);
+        if (!isReady) await ensureReady();
+        const report = await mcpServer.searchPublishedCatalog(query);
+        return report.hits.map((hit) => hit.projection);
+      },
+      hybridSearch: async (query: CatalogHybridSearchQuery) => {
+        if (pgPim && !isReady) await ensureReady();
+        return mcpServer.searchPublishedCatalog(query);
+      },
     },
     orders: {
       list: async (input: ListOrdersKeysetInput = {}) => {
@@ -610,6 +630,39 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
         mcpServer.diagnosePriceWaterfall(input),
       listLogs: async (limit = 25) => mcpServer.listInvocationLogs(limit),
     },
+    pim: {
+      getSyncStatus: async () => {
+        if (pgPim && !isReady) await ensureReady();
+        const [auditHistory, materializedProjections] = await Promise.all([
+          pimAdapter.listAuditHistory(10), pimAdapter.listMaterializedProjections(),
+        ]);
+        return {
+          systemSource: auditHistory[0]?.systemSource ?? SAMPLE_AKENEO_PIM_EXPORT.systemSource,
+          lastSyncIso: auditHistory[0]?.executedAtIso ?? null,
+          materializedProjectionsCount: materializedProjections.length,
+          auditHistory,
+          materializedProjections,
+        };
+      },
+      syncSample: async (simulateFault = false) => {
+        if (pgPim && !isReady) await ensureReady();
+        const payload = simulateFault ? INVALID_PIM_EXPORT_FAULT_DEMO : SAMPLE_AKENEO_PIM_EXPORT;
+        return pimAdapter.ingestPimPayload(payload);
+      },
+      previewSync: async (payload?: PimIngestionPayload) => {
+        if (pgPim && !isReady) await ensureReady();
+        return pimAdapter.previewSync(payload ?? SAMPLE_AKENEO_PIM_EXPORT);
+      },
+      listAuditHistory: async (limit = 10) => {
+        if (pgPim && !isReady) await ensureReady();
+        const boundedLimit = Number.isFinite(limit) ? Math.min(100, Math.max(0, Math.trunc(limit))) : 10;
+        return pimAdapter.listAuditHistory(boundedLimit);
+      },
+      listProjections: async () => {
+        if (pgPim && !isReady) await ensureReady();
+        return pimAdapter.listMaterializedProjections();
+      },
+    },
   };
 
   /**
@@ -720,6 +773,23 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
           },
           400
         );
+      }
+    }
+
+    // Enterprise PIM Ingestion Webhook Endpoint: POST /api/pim/webhook
+    if (req.method === "POST" && url.pathname === "/api/pim/webhook") {
+      try {
+        const payload = (await req.json()) as PimIngestionPayload;
+        const result = await pimAdapter.ingestPimPayload(payload);
+        return jsonResponse({ ok: result.ok, data: result }, result.ok ? 200 : 422);
+      } catch (err) {
+        if (err instanceof PimCatalogConflictError) {
+          return jsonResponse({ ok: false, error: err.message }, 409);
+        }
+        if (err instanceof InvalidPimPayloadError || err instanceof SyntaxError) {
+          return jsonResponse({ ok: false, error: err.message }, 400);
+        }
+        throw err;
       }
     }
 
@@ -875,6 +945,29 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
             normalizeCartInputFromJson(body as unknown as CartCalculationInput)
           );
           return jsonResponse({ ok: true, data: diag });
+        }
+        case "pim.getSyncStatus": {
+          const status = await rpcClient.pim.getSyncStatus();
+          return jsonResponse({ ok: true, data: status });
+        }
+        case "pim.sync": {
+          const simulateFault = Boolean(body["simulateFault"]);
+          const res = await rpcClient.pim.syncSample(simulateFault);
+          return jsonResponse({ ok: true, data: res });
+        }
+        case "pim.preview": {
+          const payload = body["payload"] as PimIngestionPayload | undefined;
+          const preview = await rpcClient.pim.previewSync(payload);
+          return jsonResponse({ ok: true, data: preview });
+        }
+        case "pim.listLogs": {
+          const limit = typeof body["limit"] === "number" ? body["limit"] : 10;
+          const logs = await rpcClient.pim.listAuditHistory(limit);
+          return jsonResponse({ ok: true, data: logs });
+        }
+        case "pim.listProjections": {
+          const projections = await rpcClient.pim.listProjections();
+          return jsonResponse({ ok: true, data: projections });
         }
         case "orders.analyticsBySku": {
           const stats = await rpcClient.orders.analyticsBySku({
@@ -1248,7 +1341,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
           channelMatch?.[1] ??
           "us-retail";
 
-        const items = mcpServer.searchCatalogHybrid({ channelSlug });
+        const items = await rpcClient.catalog.search({ channelSlug });
         return jsonResponse({
           data: {
             products: {
@@ -1307,6 +1400,7 @@ export function createSuperCommerceGateway(options: SuperCommerceGatewayOptions 
     b2bService,
     reaperService,
     mcpServer,
+    pimAdapter,
     inventoryService,
   };
 }

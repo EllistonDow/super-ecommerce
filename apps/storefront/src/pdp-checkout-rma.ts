@@ -96,6 +96,13 @@ export function escapeHtml(text: string): string {
     .replaceAll("'", "&#39;");
 }
 
+export const STOREFRONT_ESCAPE_HTML_SCRIPT = `
+    function escapeHtml(value) {
+      return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+    }
+`;
+
 export const STOREFRONT_SHARED_CSS = `
   :root {
     --bg-primary: #F8FAFC;
@@ -859,10 +866,10 @@ export function renderProductDetailHtml(input: ProductDetailRenderInput): string
   <script type="module">
     const CURRENCY = ${JSON.stringify(projection.currencyCode)};
     const CHANNEL_SLUG = ${JSON.stringify(activeChannel.slug)};
-    const VARIANTS = ${JSON.stringify(serializedVariantsPayload)};
+    const VARIANTS = ${JSON.stringify(serializedVariantsPayload).replaceAll("<", "\\u003c")};
     const CART_KEY = "kronos_cart_v1";
 
-    let currentSku = ${JSON.stringify(activePayload.sku)};
+    let currentSku = ${JSON.stringify(activePayload.sku).replaceAll("<", "\\u003c")};
     const qtyInput = document.getElementById("pdp-qty-input");
     const toastEl = document.getElementById("pdp-toast");
 
@@ -1254,6 +1261,8 @@ export function renderCheckoutPageHtml(input: CheckoutPageRenderInput): string {
 
     let cartLines = loadCart();
 
+    ${STOREFRONT_ESCAPE_HTML_SCRIPT}
+
     function saveCart() {
       try {
         localStorage.setItem(CART_KEY, JSON.stringify(cartLines));
@@ -1273,7 +1282,7 @@ export function renderCheckoutPageHtml(input: CheckoutPageRenderInput): string {
             '<div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--bg-subtle);">' +
             '<div>' +
             '<div style="font-weight: 650; font-size: 0.9rem;">' +
-            l.variantId +
+            escapeHtml(l.variantId) +
             (l.isGift ? ' <span class="badge-pill badge-blue">FREE GIFT</span>' : "") +
             "</div>" +
             '<div class="mono-meta" style="font-size: 0.74rem; color: var(--text-secondary);">' +
@@ -1289,13 +1298,13 @@ export function renderCheckoutPageHtml(input: CheckoutPageRenderInput): string {
               ? ""
               : '<div style="display: inline-flex; gap: 6px; margin-top: 6px;">' +
                 '<button type="button" class="btn-secondary btn-press" style="padding: 2px 8px; font-size: 0.74rem;" data-qty-sku="' +
-                l.variantId +
+                escapeHtml(l.variantId) +
                 '" data-qty-delta="-1">-1</button>' +
                 '<button type="button" class="btn-secondary btn-press" style="padding: 2px 8px; font-size: 0.74rem;" data-qty-sku="' +
-                l.variantId +
+                escapeHtml(l.variantId) +
                 '" data-qty-delta="1">+1</button>' +
                 '<button type="button" class="btn-secondary btn-press" style="padding: 2px 8px; font-size: 0.74rem;" data-remove-sku="' +
-                l.variantId +
+                escapeHtml(l.variantId) +
                 '">Remove</button>' +
                 "</div>") +
             "</div>" +
@@ -1891,6 +1900,7 @@ export function renderOrderDetailRmaHtml(input: OrderDetailRmaRenderInput): stri
   </main>
 
   <script type="module">
+    ${STOREFRONT_ESCAPE_HTML_SCRIPT}
     const ORDER_ID = ${JSON.stringify(order.orderId)};
 
     function collectRmaLines() {
@@ -1955,7 +1965,7 @@ export function renderOrderDetailRmaHtml(input: OrderDetailRmaRenderInput): stri
           .map(
             (l) =>
               "<div>" +
-              l.variantId +
+              escapeHtml(l.variantId) +
               " x" +
               l.acceptedReturnQuantity +
               ": " +

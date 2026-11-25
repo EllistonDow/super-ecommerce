@@ -16,8 +16,14 @@
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { buildCatalogChannelProjection } from "./attribute-validator.ts";
+import {
+  CATALOG_PROJECTION_COLUMNS,
+  hydrateCatalogProjection,
+  upsertCatalogProjection,
+  type CatalogProjectionRow,
+} from "./catalog-projection-store.ts";
 import { PgWireClient } from "./pg-wire-driver.ts";
-import type { PgPoolLike } from "./pg-pool.ts";
+import type { PgPoolLike, PgQueryable } from "./pg-pool.ts";
 import type {
   CatalogChannelProjectionRecord,
   ChannelRecord,
@@ -315,49 +321,12 @@ function projectSaleorRowsToRecords(
 }
 
 async function upsertProjectionToSuperPg(
-  superClient: { query: <T = unknown>(sql: string, params?: unknown[]) => Promise<{ rows: T[] }> },
-  p: CatalogChannelProjectionRecord
+  client: PgQueryable,
+  projection: CatalogChannelProjectionRecord,
 ): Promise<void> {
-  const safeProductUuid = ensureUuid("super-product", p.productId);
-  const snapJson = JSON.stringify(
-    p.variantsSnapshot.map((v) => ({
-      ...v,
-      effectivePrice: v.effectivePrice.toString(),
-      compareAtAmount: v.compareAtAmount?.toString(),
-    }))
-  );
-  await superClient.query(
-    `
-    INSERT INTO catalog_channel_projections (
-      channel_slug, product_id, product_slug, product_name, currency_code,
-      min_effective_price, max_effective_price, is_in_stock, total_available_qty,
-      merged_attributes, variants_snapshot
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    ON CONFLICT (channel_slug, product_id) DO UPDATE SET
-      product_slug = EXCLUDED.product_slug,
-      product_name = EXCLUDED.product_name,
-      min_effective_price = EXCLUDED.min_effective_price,
-      max_effective_price = EXCLUDED.max_effective_price,
-      is_in_stock = EXCLUDED.is_in_stock,
-      total_available_qty = EXCLUDED.total_available_qty,
-      merged_attributes = EXCLUDED.merged_attributes,
-      variants_snapshot = EXCLUDED.variants_snapshot,
-      updated_at = now()
-    `,
-    [
-      p.channelSlug,
-      safeProductUuid,
-      p.productSlug,
-      p.productName,
-      p.currencyCode,
-      p.minEffectivePrice,
-      p.maxEffectivePrice,
-      p.isInStock,
-      p.totalAvailableQty,
-      p.mergedAttributes,
-      JSON.parse(snapJson),
-    ]
-  );
+  await upsertCatalogProjection(client, {
+    ...projection, productId: ensureUuid("super-product", projection.productId),
+  }, "SEED");
 }
 
 let activeTenantKeyState: SaleorTenantKey = "ntms";
@@ -782,6 +751,7 @@ export interface CatalogJsonbFacetQueryInput {
   readonly minAvailableQty?: number;
   readonly searchQuery?: string;
   readonly sortBy?: CatalogFacetSortOrder;
+  readonly includeOutOfStock?: boolean;
   readonly superPort?: number;
   readonly seedProjections?: readonly CatalogChannelProjectionRecord[];
   readonly deleteProductIds?: readonly string[];
@@ -957,15 +927,10 @@ export async function queryCatalogProjectionsWithJsonbFacets(
   }
 
   const containmentJsonb = JSON.stringify(primaryContainment);
-  const whereClauses: string[] = [
-    `channel_slug = $1`,
-    `is_in_stock = true`,
-  ];
+  const stockFilter = input.includeOutOfStock ? [] : ["is_in_stock = true"];
+  const whereClauses: string[] = ["channel_slug = $1", ...stockFilter];
   const queryParams: unknown[] = [channelSlug];
-  const sqlPreviewWhere: string[] = [
-    `channel_slug = '${channelSlug}'`,
-    `is_in_stock = true`,
-  ];
+  const sqlPreviewWhere: string[] = [`channel_slug = '${channelSlug}'`, ...stockFilter];
 
   if (Object.keys(primaryContainment).length > 0) {
     queryParams.push(primaryContainment);
@@ -1040,7 +1005,12 @@ export async function queryCatalogProjectionsWithJsonbFacets(
       for (const delId of input.deleteProductIds) {
         const safeProductUuid = ensureUuid("super-product", delId);
         await superClient.query(
-          `DELETE FROM catalog_channel_projections WHERE channel_slug = $1 AND product_id = $2`,
+          `DELETE FROM catalog_channel_projections projection
+           WHERE channel_slug = $1 AND product_id = $2
+             AND NOT EXISTS (
+               SELECT 1 FROM products p WHERE p.slug = projection.product_slug
+               AND to_jsonb(p)->>'pim_source' IS NOT NULL
+             )`,
           [channelSlug, safeProductUuid]
         );
       }
@@ -1052,44 +1022,30 @@ export async function queryCatalogProjectionsWithJsonbFacets(
       }
     }
 
-    interface RawProjectionPgRow {
-      channel_slug: string;
-      product_id: string;
-      product_slug: string;
-      product_name: string;
-      currency_code: string;
-      min_effective_price: string;
-      max_effective_price: string;
-      is_in_stock: string;
-      total_available_qty: string;
-      merged_attributes: string;
-      variants_snapshot: string;
-    }
-
-    const rowSelectCols = `
-      channel_slug, product_id::text, product_slug, product_name, TRIM(currency_code) AS currency_code,
-      min_effective_price::text, max_effective_price::text, is_in_stock::text,
-      total_available_qty::text, merged_attributes::text, variants_snapshot::text
-    `;
-
-    const allRes = await superClient.query<RawProjectionPgRow>(
-      `SELECT ${rowSelectCols} FROM catalog_channel_projections WHERE channel_slug = $1 AND is_in_stock = true`,
-      [channelSlug]
+    const publicationFilter = `NOT EXISTS (
+      SELECT 1 FROM products p WHERE p.slug = projection.product_slug
+        AND p.id <> projection.product_id AND to_jsonb(p)->>'pim_source' IS NOT NULL
+    )`;
+    const channelFilter = ["channel_slug = $1", ...stockFilter, publicationFilter].join(" AND ");
+    const allRes = await superClient.query<CatalogProjectionRow>(
+      `SELECT ${CATALOG_PROJECTION_COLUMNS}
+       FROM catalog_channel_projections projection WHERE ${channelFilter}`,
+      [channelSlug],
     );
 
     const parameterizedSql = `
-      SELECT ${rowSelectCols}
-      FROM catalog_channel_projections
-      WHERE ${whereClauses.join(" AND ")}
+      SELECT ${CATALOG_PROJECTION_COLUMNS}
+      FROM catalog_channel_projections projection
+      WHERE ${[...whereClauses, publicationFilter].join(" AND ")}
       ORDER BY ${orderByClause}
       LIMIT 64
     `;
 
     const timingsUs: number[] = [];
-    let filteredRows: readonly RawProjectionPgRow[] = [];
+    let filteredRows: readonly CatalogProjectionRow[] = [];
     for (let i = 0; i < 3; i++) {
       const t0 = process.hrtime.bigint();
-      const res = await superClient.query<RawProjectionPgRow>(
+      const res = await superClient.query<CatalogProjectionRow>(
         parameterizedSql,
         queryParams
       );
@@ -1102,56 +1058,9 @@ export async function queryCatalogProjectionsWithJsonbFacets(
       await (superClient as PgWireClient).close();
     }
 
-    const hydrateRow = (
-      r: RawProjectionPgRow
-    ): CatalogChannelProjectionRecord => {
-      const parsedAttrs = JSON.parse(r.merged_attributes || "{}") as Record<
-        string,
-        readonly (string | number | boolean)[]
-      >;
-      const rawSnap = JSON.parse(r.variants_snapshot || "[]") as {
-        variantId: string;
-        sku: string;
-        name: string;
-        effectivePrice: string;
-        compareAtAmount?: string;
-        availableQuantity?: number;
-        availableQty?: number;
-        isInStock?: boolean;
-        attributes: DynamicAttributesMap;
-      }[];
-      return {
-        channelSlug: r.channel_slug,
-        productId: r.product_id,
-        productSlug: r.product_slug,
-        productName: r.product_name,
-        currencyCode: r.currency_code,
-        minEffectivePrice: BigInt(r.min_effective_price || "0"),
-        maxEffectivePrice: BigInt(r.max_effective_price || "0"),
-        isInStock: r.is_in_stock === "true" || r.is_in_stock === "t",
-        totalAvailableQty: Number(r.total_available_qty || "0"),
-        mergedAttributes: parsedAttrs,
-        variantsSnapshot: rawSnap.map((v) => {
-          const avail = Number(v.availableQuantity ?? v.availableQty ?? 0);
-          return {
-            variantId: v.variantId,
-            sku: v.sku,
-            name: v.name,
-            effectivePrice: BigInt(v.effectivePrice || "0"),
-            compareAtAmount: v.compareAtAmount
-              ? BigInt(v.compareAtAmount)
-              : undefined,
-            availableQuantity: avail,
-            isInStock: v.isInStock ?? avail > 0,
-            attributes: v.attributes ?? {},
-          };
-        }),
-      };
-    };
-
-    const allChannelProjections = allRes.rows.map(hydrateRow);
+    const allChannelProjections = allRes.rows.map(hydrateCatalogProjection);
     const matchedProjections = sortProjections(
-      filteredRows.map(hydrateRow),
+      filteredRows.map(hydrateCatalogProjection),
       sortBy,
       activeTenant.containerName
     );
@@ -1180,7 +1089,7 @@ export async function queryCatalogProjectionsWithJsonbFacets(
     if (!poolClient) {
       await (superClient as PgWireClient).close().catch(() => {});
     }
-    const fallbackAll = (input.seedProjections ?? []).filter((p) => p.isInStock);
+    const fallbackAll = (input.seedProjections ?? []).filter((p) => input.includeOutOfStock || p.isInStock);
     const filtered = sortProjections(
       fallbackAll.filter(
         (p) =>

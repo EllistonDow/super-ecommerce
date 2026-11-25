@@ -1,6 +1,7 @@
 export * from "./schema-types.ts";
 export * from "./bigint-json.ts";
 export * from "./attribute-validator.ts";
+export * from "./catalog-projection-store.ts";
 export * from "./pg-wire-driver.ts";
 export * from "./pg-pool.ts";
 export * from "./migrator.ts";
